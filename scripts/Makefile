@@ -13,7 +13,19 @@ fido_alliance_mds.jwt:
 metadata.json: globalsign_root_r3.der fido_alliance_mds.jwt
 	$(PYTHON) update_metadata.py > metadata.json
 
-all: metadata.json
+apple_webauthn_root_ca.pem:
+	$(CURl) -o apple_webauthn_root_ca.pem https://www.apple.com/certificateauthority/Apple_WebAuthn_Root_CA.pem
+
+iana_cose_algs.csv:
+	$(CURL) -o iana_cose_algs.csv https://www.iana.org/assignments/cose/algorithms.csv
+
+cose_algs: iana_cose_algs.csv
+	$(PYTHON) -c "from csv import DictReader; print({item.get('Value'): item.get('Name') for item in DictReader(open('./iana_cose_algs.csv'))})"
+
+clean:
+	rm metadata.json globalsign_root_r3.der fido_alliance_mds.jwt iana_cose_algs.csv
+
+all: metadata.json apple_webauthn_root_ca.pem
 
 .DEFAULT_GOAL:= all
 .PHONY: all

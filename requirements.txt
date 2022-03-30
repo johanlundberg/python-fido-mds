@@ -1,3 +1,5 @@
 cryptography==36.0.2
 jwcrypto==1.0
 pyOpenSSL==22.0.0
+fido2==0.9.3
+iso3166==2.0.2

@@ -9,11 +9,13 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 from jwcrypto import jwk, jws
 
+
 __author__ = 'lundberg'
 
 METADATA = Path('./fido_alliance_mds.jwt')
 ROOT_CERT = Path('./globalsign_root_r3.der')
 CN = 'mds.fidoalliance.org'
+
 
 
 def load_root_cert(path: Path) -> x509.Certificate:
@@ -104,12 +106,12 @@ def load_metadata(path: Path, root_cert: x509.Certificate) -> Optional[Dict[str,
             continue
 
     if verified:
-        return json.loads(_jws.payload.decode('utf-8'))
+        return json.loads(_jws.payload.decode())
 
     return None
 
 
-def get_metadata(metadata_path: Path, root_cert_path: Path) -> Optional[Dict[str, Any]]:
+def get_metadata(metadata_path: Path, root_cert_path: Path) -> Dict[str, Any]:
     root_cert = load_root_cert(path=root_cert_path)
     metadata = load_metadata(path=metadata_path, root_cert=root_cert)
     return metadata
