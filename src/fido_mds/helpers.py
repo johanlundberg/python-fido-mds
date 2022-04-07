@@ -1,15 +1,25 @@
 # -*- coding: utf-8 -*-
-from dataclasses import dataclass
-from typing import Union
 
+import logging
+
+from dataclasses import dataclass
+from typing import Union, List, Type
+
+from OpenSSL import crypto
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, EllipticCurveSignatureAlgorithm, EllipticCurvePublicKey
+
+from cryptography.hazmat.primitives.asymmetric.types import CERTIFICATE_PUBLIC_KEY_TYPES
+
+from cryptography.hazmat.primitives.hashes import SHA256, HashAlgorithm
 
 __author__ = 'lundberg'
 
-from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, EllipticCurveSignatureAlgorithm
+from cryptography.x509 import Certificate
 
-from cryptography.hazmat.primitives.hashes import SHA256, HashAlgorithm
+logger = logging.getLogger(__name__)
 
 COSE_ALGS = {
     '-65535': 'RS1',
@@ -85,17 +95,61 @@ class CoseAlg:
     hash_alg: HashAlgorithm
     sig_alg: EllipticCurveSignatureAlgorithm
 
-    def hash(self, data: bytes):
+    def hash(self, data: bytes) -> bytes:
+        h = hashes.Hash(self.hash_alg)
+        h.update(data)
+        return h.finalize()
+
+    def verify(self, key: CERTIFICATE_PUBLIC_KEY_TYPES, signature: bytes, data: bytes) -> bool:
+        try:
+            key.verify(
+                signature=signature,
+                signature_algorithm=self.sig_alg,
+                data=data,
+            )
+            return True
+        except InvalidSignature as e:
+            logger.debug(f'Signature verification failed: {e}')
+        return False
+
 
 def get_cose_alg(alg: int) -> CoseAlg:
     alg_name = COSE_ALGS.get(str(alg))
     if alg_name == 'ES256':
         return CoseAlg(hash_alg=SHA256(), sig_alg=ECDSA(algorithm=SHA256()))
+    if alg_name == 'RS256':
+        pass
     raise NotImplementedError(f'{alg_name} not implemented')
 
 
 def load_raw_cert(cert: Union[bytes, str]) -> x509.Certificate:
     if isinstance(cert, bytes):
         cert = cert.decode()
+    if cert.startswith('-----BEGIN CERTIFICATE-----'):
+        return x509.load_pem_x509_certificate(bytes(cert, encoding='utf-8'))
     raw_cert = f'-----BEGIN CERTIFICATE-----\n{cert}\n-----END CERTIFICATE-----'
     return x509.load_pem_x509_certificate(bytes(raw_cert, encoding='utf-8'))
+
+
+def cert_chain_verified(cert_chain: List[Certificate], root_certs: List[Certificate]) -> bool:
+    cert_verified = False
+    cert_to_check = cert_chain[0]  # first cert in chain is the one we want to verify
+    # create store and add root cert
+    for root_cert in root_certs:
+        store = crypto.X509Store()
+        store.add_cert(crypto.X509.from_cryptography(root_cert))
+
+        # add the rest of the chain to the store
+        for chain_cert in cert_chain[1:]:
+            cert = crypto.X509.from_cryptography(chain_cert)
+            store.add_cert(cert)
+
+        ctx = crypto.X509StoreContext(store, crypto.X509.from_cryptography(cert_to_check))
+        try:
+            ctx.verify_certificate()
+            cert_verified = True
+            logger.debug(f'Root cert with SHA256 fingerprint {root_cert.fingerprint(SHA256())} matched')
+        except crypto.X509StoreContextError:
+            logger.debug(f'Root cert with SHA256 fingerprint {root_cert.fingerprint(SHA256())} did NOT match')
+            continue
+    return cert_verified

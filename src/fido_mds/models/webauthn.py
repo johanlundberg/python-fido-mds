@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import List, TypeVar, Optional, Any
+from typing import List, TypeVar, Optional, Any, Union
 from uuid import UUID
 
 from cryptography import x509
 from cryptography.x509 import Certificate
 from fido2 import cbor
-from fido2.cose import CoseKey
-from fido2.ctap2 import AttestationObject
+from fido2.cose import CoseKey, ES256, RS256, PS256, EdDSA, RS1
+from fido2.ctap2 import AttestationObject, AuthenticatorData as RawAuthenticatorData
 from fido2.utils import websafe_decode
 from pydantic import BaseModel, Field, validator, root_validator
 
@@ -34,8 +34,11 @@ class AttestationConfig(BaseModel):
 
 class AttestationStatement(AttestationConfig):
     alg: Optional[int]
-    sig: bytes
+    sig: Optional[bytes]
     x5c: List[Certificate]
+    ver: Optional[str]
+    cert_info: Optional[bytes] = Field(alias='certInfo')
+    pub_area: Optional[bytes] = Field(alias='pubArea')
 
     @validator('x5c', pre=True)
     def validate_x5c(cls, v: List[bytes]) -> List[Certificate]:
@@ -45,11 +48,15 @@ class AttestationStatement(AttestationConfig):
 class CredentialData(AttestationConfig):
     aaguid: UUID
     credential_id: bytes
-    public_key: CoseKey
+    public_key: Union[ES256, RS256, PS256, EdDSA, RS1]
 
     @validator('aaguid', pre=True)
     def validate_aaguid(cls, v: bytes) -> UUID:
         return UUID(bytes=v)
+
+    @validator('public_key', pre=True)
+    def validate_public_key(cls, v: bytes) -> UUID:
+        return CoseKey.parse(v)
 
 
 class AuthenticatorData(AttestationConfig):
@@ -63,7 +70,7 @@ class Attestation(AttestationConfig):
     fmt: AttestationFormat
     att_statement: AttestationStatement
     auth_data: AuthenticatorData
-    raw_auth_data: Optional[bytes]
+    raw_auth_data: Optional[RawAuthenticatorData]
     ep_att: Optional[Any]
     large_blob_key: Optional[Any]
 
