@@ -1,6 +1,9 @@
+-r requirements.txt
+
 black==22.1.0
 mypy==0.941
 
 # typing stubs
-types-cryptography==3.3.18
-types-pyOpenSSL==22.0.1
+typing_extensions
+types-cryptography
+types-pyOpenSSL
