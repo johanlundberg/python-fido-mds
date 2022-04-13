@@ -3,12 +3,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional, Union, Annotated
+from typing import List, Optional, Union
 from uuid import UUID
 
 from cryptography import x509
 from cryptography.x509 import Certificate
-from fido2.attestation import AttestationType
 from fido2.cose import ES256, PS256, RS1, RS256, CoseKey, EdDSA
 from fido2.ctap2 import AttestationObject
 from fido2.utils import websafe_decode
@@ -128,7 +127,7 @@ class Attestation(AttestationConfig):
     auth_data: AuthenticatorData = Field(alias='authData')
     ep_att: Optional[bytes]
     large_blob_key: Optional[bytes]
-    attestation_obj: AttestationObject
+    attestation_obj_bytes: bytes
 
     @property
     def certificate_key_identifier(self) -> Optional[str]:
@@ -137,10 +136,14 @@ class Attestation(AttestationConfig):
             return cki.digest.hex()
         return None
 
+    @property
+    def attestation_obj(self) -> AttestationObject:
+        return AttestationObject(self.attestation_obj_bytes)
+
     @classmethod
     def from_attestation_object(cls, data: AttestationObject) -> Attestation:
         d = dict((k.string_key, v) for k, v in data.data.items())
-        d['attestation_obj'] = data
+        d['attestation_obj_bytes'] = bytes(data)
         return cls.parse_obj(d)
 
     @classmethod
