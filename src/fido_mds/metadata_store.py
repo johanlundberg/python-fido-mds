@@ -2,29 +2,25 @@
 import logging
 from importlib import resources
 from pathlib import Path
-from typing import Optional, Dict, Union
+from typing import Dict, List, Optional, Union
 from uuid import UUID
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric.ec import ECDSA, EllipticCurvePublicKey
 from cryptography.hazmat.primitives.hashes import SHA256
-from cryptography.x509 import (
-    Version,
-    NameOID,
-    BasicConstraints,
-    ObjectIdentifier,
-    ExtensionNotFound,
-    UnrecognizedExtension,
-    Certificate,
+from cryptography.x509 import Certificate
+from fido2.attestation import (
+    AndroidSafetynetAttestation,
+    AppleAttestation,
+    FidoU2FAttestation,
+    PackedAttestation,
+    TpmAttestation,
 )
-from fido2 import cbor
+from fido2.attestation.base import InvalidAttestation
+from fido2.cose import CoseKey
 from fido2.ctap2 import AttestationObject
-from fido2.utils import websafe_decode, int2bytes
-from iso3166 import countries_by_alpha2
+from fido2.utils import websafe_decode
 
-from fido_mds.helpers import get_cose_alg, cert_chain_verified, load_raw_cert
-from fido_mds.models.fido_mds import FidoMD, Entry
+from fido_mds.helpers import cert_chain_verified, hash_with, load_raw_cert
+from fido_mds.models.fido_mds import Entry, FidoMD
 
 __author__ = 'lundberg'
 
@@ -42,32 +38,70 @@ class FidoMetadataStore:
         # default to bundled metadata
         if metadata_path is not None:
             try:
-                with open(metadata_path, 'r') as f:
-                    self.metadata = FidoMD.parse_raw(f.read())
+                with open(metadata_path, 'r') as mdf:
+                    self.metadata = FidoMD.parse_raw(mdf.read())
             except IOError as e:
-                logger.error(f'Could not open file {f}: {e}')
+                logger.error(f'Could not open file {mdf}: {e}')
         else:
             with resources.open_text('fido_mds.data', 'metadata.json') as f:
                 self.metadata = FidoMD.parse_raw(f.read())
 
-        self.external_root_certs: Dict[str, Certificate] = {}
+        self.external_root_certs: Dict[str, List[Certificate]] = {}
         # load known external root certs
-        with resources.open_binary('fido_mds.data', 'apple_webauthn_root_ca.pem') as f:
-            self.add_external_root_cert(name='apple', root_cert=f.read())
-        self._aaguid_cache: Dict[UUID, Entry] = {}
+        with resources.open_binary('fido_mds.data', 'apple_webauthn_root_ca.pem') as arc:
+            self.add_external_root_certs(name='apple', root_certs=[arc.read()])
+        self._entry_cache: Dict[Union[str, UUID], Entry] = {}
 
-    def add_external_root_cert(self, name: str, root_cert: Union[bytes, str]):
-        self.external_root_certs[name] = load_raw_cert(cert=root_cert)
+    def add_external_root_certs(self, name: str, root_certs: List[Union[bytes, str]]) -> None:
+        certs = []
+        for cert in root_certs:
+            certs.append(load_raw_cert(cert=cert))
+        self.external_root_certs[name] = certs
 
     def get_entry_for_aaguid(self, aaguid: UUID) -> Optional[Entry]:
-        if aaguid in self._aaguid_cache:
-            return self._aaguid_cache[aaguid]
+        if aaguid in self._entry_cache:
+            return self._entry_cache[aaguid]
 
         for entry in self.metadata.entries:
             if entry.aaguid is not None and UUID(entry.aaguid) == aaguid:
-                self._aaguid_cache[aaguid] = entry
+                self._entry_cache[aaguid] = entry
                 return entry
         return None
+
+    def get_entry_for_certificate_key_identifier(self, cki: str) -> Optional[Entry]:
+        if cki in self._entry_cache:
+            return self._entry_cache[cki]
+
+        for entry in self.metadata.entries:
+            if (
+                entry.attestation_certificate_key_identifiers is not None
+                and cki in entry.attestation_certificate_key_identifiers
+            ):
+                self._entry_cache[cki] = entry
+                return entry
+        return None
+
+    def get_entry(self, aaguid: Optional[UUID] = None, cki: Optional[str] = None) -> Optional[Entry]:
+        if aaguid:
+            return self.get_entry_for_aaguid(aaguid=aaguid)
+        elif cki:
+            return self.get_entry_for_certificate_key_identifier(cki=cki)
+        return None
+
+    def get_root_certs(self, aaguid: Optional[UUID] = None, cki: Optional[str] = None) -> List[Certificate]:
+        metadata_entry = self.get_entry(aaguid=aaguid, cki=cki)
+        if metadata_entry:
+            return [
+                load_raw_cert(cert=root_cert)
+                for root_cert in metadata_entry.metadata_statement.attestation_root_certificates
+            ]
+        return list()
+
+    def get_authentication_algs(self, aaguid: Optional[UUID] = None, cki: Optional[str] = None) -> List[str]:
+        metadata_entry = self.get_entry(aaguid=aaguid, cki=cki)
+        if metadata_entry:
+            return metadata_entry.metadata_statement.authentication_algorithms
+        return list()
 
     def verify_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
         if attestation.fmt is AttestationFormat.PACKED:
@@ -76,162 +110,117 @@ class FidoMetadataStore:
             return self.verify_apple_anonymous_attestation(attestation=attestation, client_data=client_data)
         if attestation.fmt is AttestationFormat.TPM:
             return self.verify_tpm_attestation(attestation=attestation, client_data=client_data)
+        if attestation.fmt is AttestationFormat.ANDROID_SAFTYNET:
+            return self.verify_android_safetynet_attestation(attestation=attestation, client_data=client_data)
+        if attestation.fmt is AttestationFormat.FIDO_U2F:
+            return self.verify_fido_u2f_attestation(attestation=attestation, client_data=client_data)
         raise NotImplementedError(f'verification of {attestation.fmt.value} not implemented')
 
     def verify_packed_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
-        # if there is a cert chain it is a FULL packed attestation
-        if not attestation.att_statement.x5c:
-            raise NotImplementedError('packed SELF(SURROGATE) or ECDAA attestations not implemented')
-
-        # first cert in chain is the one we want to check
-        leaf_cert = attestation.att_statement.x5c[0]
-
-        # version MUST be set to 3 (which is indicated by an ASN.1 INTEGER with value 2).
-        logger.debug(f'cert version: {leaf_cert.version}')
-        if leaf_cert.version != Version.v3:
-            raise ValidationError(f'certificate version {leaf_cert.version} != {Version.v3}')
-
-        # Subject-C MUST be a ISO 3166 code specifying the country where the Authenticator vendor is incorporated
-        country_code = leaf_cert.subject.get_attributes_for_oid(NameOID.COUNTRY_NAME)[0].value
-        logger.debug(f'cert country code: {country_code}')
-        if country_code not in countries_by_alpha2:
-            raise ValidationError(f'country (C) {country_code} is not a recognized country code')
-
-        # Subject-O MUST be legal name of the Authenticator vendor
-        organisation_name = leaf_cert.subject.get_attributes_for_oid(NameOID.ORGANIZATION_NAME)[0].value
-        logger.debug(f'cert organization name: {organisation_name}')
-        if not organisation_name:
-            raise ValidationError(f'certificate subject organisation (O) is missing')
-
-        # Subject-OU MUST be literal string “Authenticator Attestation”
-        organization_unit = leaf_cert.subject.get_attributes_for_oid(NameOID.ORGANIZATIONAL_UNIT_NAME)[0].value
-        logger.debug(f'cert organization unit name: {organization_unit}')
-        if organization_unit != 'Authenticator Attestation':
-            raise ValidationError(f'certificate subject organisation unit (OU) is not "Authenticator Attestation"')
-
-        # Subject-CN MUST not be empty
-        common_name = leaf_cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
-        logger.debug(f'cert common name: {common_name}')
-        if not common_name:
-            raise ValidationError(f'certificate common name (CN) is missing')
-
-        # check that cert basic constraints for CA is set to False
-        basic_constraints = leaf_cert.extensions.get_extension_for_class(BasicConstraints).value
-        logger.debug(f'cert basic constraints ca: {basic_constraints.ca}')
-        if basic_constraints.ca is not False:
-            raise ValidationError(f'cert basic constraints ca must be False')
-
-        # if certificate contains id-fido-gen-ce-aaguid extension, then check that its value set to the
-        # AAGUID returned by the authenticator in authData
-        ID_FIDO_GEN_CE_AAGUID_OID = ObjectIdentifier('1.3.6.1.4.1.45724.1.1.4')
-        id_fido_gen_ce_aaguid = None
+        cose_key = CoseKey.for_alg(attestation.att_statement.alg)
+        client_data_hash = hash_with(hash_alg=cose_key._HASH_ALG, data=client_data)
         try:
-            id_fido_gen_ce_aaguid_ext = leaf_cert.extensions.get_extension_for_oid(ID_FIDO_GEN_CE_AAGUID_OID)
-            if isinstance(id_fido_gen_ce_aaguid_ext, UnrecognizedExtension):
-                # cryptography does not know the extension, create UUID from the bytes in value
-                b_aaguid = id_fido_gen_ce_aaguid_ext.value
-                # see https://www.w3.org/TR/webauthn-2/#sctn-packed-attestation-cert-requirements
-                if len(b_aaguid) == 18 and b_aaguid[:2] == b'\x04\x10':
-                    id_fido_gen_ce_aaguid = UUID(bytes=b_aaguid[2:])
-                else:
-                    raise ValidationError('Could not parse AAGUID from certificate extension')
-        except ExtensionNotFound:
-            # If the related attestation root certificate is used for multiple authenticator models,
-            # the Extension id-fido-gen-ce-aaguid MUST be present
-            # TODO: Should we make a check for this?
-            pass
-        if id_fido_gen_ce_aaguid is not None:
-            logger.debug(f'cert id_fido_gen_ce_aaguid extension: {id_fido_gen_ce_aaguid}')
-            if id_fido_gen_ce_aaguid != attestation.auth_data.credential_data.aaguid:
-                raise ValidationError(
-                    f'cert id_fido_gen_ce_aaguid extension {id_fido_gen_ce_aaguid} does'
-                    f' not match {attestation.auth_data.credential_data.aaguid}'
-                )
-        # concatenate authData with clientDataHash to create signatureBase and verify that using cert public key
-        cose_alg = get_cose_alg(attestation.att_statement.alg)
-        client_data_hash = cose_alg.hash(data=client_data)
-        signature_base = attestation.raw_auth_data + client_data_hash
-        if not cose_alg.verify(
-            key=leaf_cert.public_key(), signature=attestation.att_statement.sig, data=signature_base
-        ):
-            raise ValidationError('signature does not match data')
+            PackedAttestation().verify(
+                statement=attestation.attestation_obj.att_statement,
+                auth_data=attestation.attestation_obj.auth_data,
+                client_data_hash=client_data_hash,
+            )
+        except InvalidAttestation as e:
+            raise ValidationError(f'Invalid attestation: {e}')
 
-        # validata leaf cert again root cert in metadata
-        metadata_entry = self.get_entry_for_aaguid(aaguid=attestation.auth_data.credential_data.aaguid)
-        root_certs = [
-            load_raw_cert(root_cert) for root_cert in metadata_entry.metadata_statement.attestation_root_certificates
-        ]
-        if not cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=root_certs):
-            raise ValidationError('metadata root cert does not match attestation cert')
-
-        return True
+        # validate leaf cert again root cert in metadata
+        root_certs = self.get_root_certs(aaguid=attestation.auth_data.credential_data.aaguid)
+        if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=root_certs):
+            return True
+        raise ValidationError('metadata root cert does not match attestation cert')
 
     def verify_apple_anonymous_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
-        if not attestation.att_statement.x5c:
-            raise ValidationError('no cert chain found in attestation')
-
-        # first cert in chain is the one we want to check
-        leaf_cert = attestation.att_statement.x5c[0]
-
-        # concatenate authenticator data and SHA-256 hash of client data to form nonce base
-        client_data_hash = hashes.Hash(SHA256())
-        client_data_hash.update(data=client_data)
-        nonce_base = attestation.raw_auth_data + client_data_hash.finalize()
-
-        # perform SHA-256 hash of nonce base to produce nonce
-        nonce_hash = hashes.Hash(SHA256())
-        nonce_hash.update(nonce_base)
-        expected_nonce = nonce_hash.finalize()
-
-        # check that certificate contains AppleAnonymousAttestation OID 1.2.840.113635.100.8.2 extension
-        APPLE_NONCE_EXTENSION_OID = ObjectIdentifier('1.2.840.113635.100.8.2')
+        client_data_hash = hash_with(hash_alg=SHA256(), data=client_data)
         try:
-            apple_nonce_ext = leaf_cert.extensions.get_extension_for_oid(APPLE_NONCE_EXTENSION_OID)
-            apple_nonce = apple_nonce_ext.value.value  # type: ignore
-            # verify that expected_nonce equals the value of the extension with OID 1.2.840.113635.100.8.2 in leaf cert
-            # remove the 6 first bytes as that is just structure
-            # see https://medium.com/webauthnworks/webauthn-fido2-verifying-apple-anonymous-attestation-5eaff334c849
-            if len(apple_nonce) != 38 or apple_nonce[6:] != expected_nonce:
-                raise ValidationError('Apple nonce does not match attestation')
-        except ExtensionNotFound:
-            raise ValidationError('Apple nonce certificate extension not found')
-
-        # verify that the credential public key equals the Subject Public Key of leaf cert
-        cose_cert_pub = attestation.auth_data.credential_data.public_key.from_cryptography_key(leaf_cert.public_key())
-        if attestation.auth_data.credential_data.public_key != cose_cert_pub:
-            raise ValidationError('credential data public key does not match cert subject public key')
+            AppleAttestation().verify(
+                statement=attestation.attestation_obj.att_statement,
+                auth_data=attestation.attestation_obj.auth_data,
+                client_data_hash=client_data_hash,
+            )
+        except InvalidAttestation as e:
+            raise ValidationError(f'Invalid attestation: {e}')
 
         # validata leaf cert against Apple root cert
-        if not cert_chain_verified(
-            cert_chain=attestation.att_statement.x5c, root_certs=[self.external_root_certs['apple']]
-        ):
-            raise ValidationError('metadata root cert does not match attestation cert')
-        return True
+        if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=self.external_root_certs['apple']):
+            return True
+        raise ValidationError('metadata root cert does not match attestation cert')
 
     def verify_tpm_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
-        # FIDO2 support only version 2.0
-        if attestation.att_statement.ver != "2.0":
-            raise ValidationError(f'attestation statement version {attestation.att_statement.ver} is not 2.0')
-        # verify cert_info
-        # magic must be TPM_GENERATED (0xFF544347)
-        if attestation.att_statement.cert_info[0:4] != int2bytes(0xFF544347):
-            raise ValidationError('wrong magic in certInfo')
-        debug = 1
+        client_data_hash = hash_with(hash_alg=SHA256(), data=client_data)
+        try:
+            TpmAttestation().verify(
+                statement=attestation.attestation_obj.att_statement,
+                auth_data=attestation.attestation_obj.auth_data,
+                client_data_hash=client_data_hash,
+            )
+        except InvalidAttestation as e:
+            raise ValidationError(f'Invalid attestation: {e}')
+
+        # validata leaf cert again root cert in metadata
+        root_certs = self.get_root_certs(aaguid=attestation.auth_data.credential_data.aaguid)
+        if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=root_certs):
+            return True
+        raise ValidationError('metadata root cert does not match attestation cert')
+
+    def verify_android_safetynet_attestation(
+        self, attestation: Attestation, client_data: bytes, allow_rooted_device: bool = False
+    ) -> bool:
+        client_data_hash = hash_with(hash_alg=SHA256(), data=client_data)
+        try:
+            AndroidSafetynetAttestation(allow_rooted=allow_rooted_device).verify(
+                statement=attestation.attestation_obj.att_statement,
+                auth_data=attestation.attestation_obj.auth_data,
+                client_data_hash=client_data_hash,
+            )
+        except InvalidAttestation as e:
+            raise ValidationError(f'Invalid attestation: {e}')
+
+        # TODO: jwt header alg should correspond to a authentication alg in metadata, but how?
+        #   header alg RS256 is not in metadata algs ['secp256r1_ecdsa_sha256_raw']
+        # authn_algs = self.get_authentication_algs(aaguid=attestation.auth_data.credential_data.aaguid)
+        # alg = attestation.att_statement.response.header.alg
+        # validata leaf cert again root cert in metadata
+        if not attestation.att_statement.response:
+            raise ValidationError('attestation is missing response jwt')
+        root_certs = self.get_root_certs(aaguid=attestation.auth_data.credential_data.aaguid)
+        if cert_chain_verified(cert_chain=attestation.att_statement.response.header.x5c, root_certs=root_certs):
+            return True
+        raise ValidationError('metadata root cert does not match attestation cert')
+
+    def verify_fido_u2f_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
+        client_data_hash = hash_with(hash_alg=SHA256(), data=client_data)
+        try:
+            FidoU2FAttestation().verify(
+                statement=attestation.attestation_obj.att_statement,
+                auth_data=attestation.attestation_obj.auth_data,
+                client_data_hash=client_data_hash,
+            )
+        except InvalidAttestation as e:
+            raise ValidationError(f'Invalid attestation: {e}')
+
+        root_certs = self.get_root_certs(cki=attestation.certificate_key_identifier)
+        if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=root_certs):
+            return True
+        raise ValidationError('metadata root cert does not match attestation cert')
 
 
 md = FidoMetadataStore()
 # print(md.metadata.json())
 
 # orange yubikey
-yubikey_4 = 'o2NmbXRoZmlkby11MmZnYXR0U3RtdKJjc2lnWEcwRQIgUHqDeN8I0KSrvYbA5eQ_g_csqzOgY8Rfmwtnn_94i-ECIQCuKt86sg6jgTf0EVUlSqHjcLcLce5X65fF5jIDxx8pHGN4NWOBWQJIMIICRDCCAS6gAwIBAgIEVWK-oDALBgkqhkiG9w0BAQswLjEsMCoGA1UEAxMjWXViaWNvIFUyRiBSb290IENBIFNlcmlhbCA0NTcyMDA2MzEwIBcNMTQwODAxMDAwMDAwWhgPMjA1MDA5MDQwMDAwMDBaMCoxKDAmBgNVBAMMH1l1YmljbyBVMkYgRUUgU2VyaWFsIDE0MzI1MzQ2ODgwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARLMx93PYFEuZlcvkWFUX4XWDqkdiNpXL6FrEgsgBnyyblGeuBFsOZvExsuoyQ8kf2mAuMY8_xdjSp6uucr0UMJozswOTAiBgkrBgEEAYLECgIEFTEuMy42LjEuNC4xLjQxNDgyLjEuNTATBgsrBgEEAYLlHAIBAQQEAwIFIDALBgkqhkiG9w0BAQsDggEBAKwW2bNutrOpt211lLNPWfT3PtvJ_espNetrRRyr9B0l0-cWFNdHJgTKcqV44yPtt2AEaF8F59G5vgXbbpRA-sXPyTKmyvroUpl3LtsCeCAgPNQUHT7rb2os6Z45V4AyY6urjW7EgKffCErSy6e31td8lMPrwLFm-WBXyvX-OmMeompDN2Kjb77PTPRFCWJf1a8QSap8i8dommZZ6a9d6PDXLCiCUXTFDgarf2oHkIN7bbMqv9y8qDXLuwkO8fDZnghpv-nlZ2TEIw5sBXcpsBDeDsX5zOTJHCgmIY6oCBq7lpFR7BZyWvKo2V53lbyqInqblEMgxCdhnKr4VNmCmNdoYXV0aERhdGFYxNz3BHEmKmoM4iTRAmMUgSjEdNSeKZskhyDzwzPuNmHTQQAAAAAAAAAAAAAAAAAAAAAAAAAAAEBUxM3Zkcq64TUqrXr2nh7urP1cRiwmeX5tyGj22YmQTvRu5z8c-wrptwqJ6Gef15JjZGvkb6epX-6ANI7MNC57pQECAyYgASFYIChWSEnPLFGZFdeiujDUrDRE8YkL5sYM-i_mDgC2QtBPIlgg5vKsrM8Z7fI5rJAiZBVVftNMjiVIX56mKsf6eCZZgU0'
+yubikey_4_attestation_obj = 'o2NmbXRoZmlkby11MmZnYXR0U3RtdKJjc2lnWEcwRQIgUHqDeN8I0KSrvYbA5eQ_g_csqzOgY8Rfmwtnn_94i-ECIQCuKt86sg6jgTf0EVUlSqHjcLcLce5X65fF5jIDxx8pHGN4NWOBWQJIMIICRDCCAS6gAwIBAgIEVWK-oDALBgkqhkiG9w0BAQswLjEsMCoGA1UEAxMjWXViaWNvIFUyRiBSb290IENBIFNlcmlhbCA0NTcyMDA2MzEwIBcNMTQwODAxMDAwMDAwWhgPMjA1MDA5MDQwMDAwMDBaMCoxKDAmBgNVBAMMH1l1YmljbyBVMkYgRUUgU2VyaWFsIDE0MzI1MzQ2ODgwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARLMx93PYFEuZlcvkWFUX4XWDqkdiNpXL6FrEgsgBnyyblGeuBFsOZvExsuoyQ8kf2mAuMY8_xdjSp6uucr0UMJozswOTAiBgkrBgEEAYLECgIEFTEuMy42LjEuNC4xLjQxNDgyLjEuNTATBgsrBgEEAYLlHAIBAQQEAwIFIDALBgkqhkiG9w0BAQsDggEBAKwW2bNutrOpt211lLNPWfT3PtvJ_espNetrRRyr9B0l0-cWFNdHJgTKcqV44yPtt2AEaF8F59G5vgXbbpRA-sXPyTKmyvroUpl3LtsCeCAgPNQUHT7rb2os6Z45V4AyY6urjW7EgKffCErSy6e31td8lMPrwLFm-WBXyvX-OmMeompDN2Kjb77PTPRFCWJf1a8QSap8i8dommZZ6a9d6PDXLCiCUXTFDgarf2oHkIN7bbMqv9y8qDXLuwkO8fDZnghpv-nlZ2TEIw5sBXcpsBDeDsX5zOTJHCgmIY6oCBq7lpFR7BZyWvKo2V53lbyqInqblEMgxCdhnKr4VNmCmNdoYXV0aERhdGFYxNz3BHEmKmoM4iTRAmMUgSjEdNSeKZskhyDzwzPuNmHTQQAAAAAAAAAAAAAAAAAAAAAAAAAAAEBUxM3Zkcq64TUqrXr2nh7urP1cRiwmeX5tyGj22YmQTvRu5z8c-wrptwqJ6Gef15JjZGvkb6epX-6ANI7MNC57pQECAyYgASFYIChWSEnPLFGZFdeiujDUrDRE8YkL5sYM-i_mDgC2QtBPIlgg5vKsrM8Z7fI5rJAiZBVVftNMjiVIX56mKsf6eCZZgU0'
 yubikey_4_client_data = 'eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoicUUyQi1FQ25ZRHhuRXZlbzVIVmQ0ZjFxVUotNnhkbU9oNHFIenAtSnI2TSIsIm9yaWdpbiI6Imh0dHBzOi8vZGFzaGJvYXJkLmVkdWlkLmRvY2tlciIsImNyb3NzT3JpZ2luIjpmYWxzZX0'
 yubikey_4_credential_id = 'VMTN2ZHKuuE1Kq169p4e7qz9XEYsJnl-bcho9tmJkE70buc_HPsK6bcKiehnn9eSY2Rr5G-nqV_ugDSOzDQuew'
-
-
-yubico_security_key = 'o2NmbXRoZmlkby11MmZnYXR0U3RtdKJjc2lnWEcwRQIhAOy8_rzA7xpWVGMoc_0JeB-lqCY_sFygaeajB0fG8XpzAiBsb5ZSbuivkHIkh0RaPs2S_xMZyqg7a_Y9uqmnDrOzcGN4NWOBWQLCMIICvjCCAaagAwIBAgIEdIb9wjANBgkqhkiG9w0BAQsFADAuMSwwKgYDVQQDEyNZdWJpY28gVTJGIFJvb3QgQ0EgU2VyaWFsIDQ1NzIwMDYzMTAgFw0xNDA4MDEwMDAwMDBaGA8yMDUwMDkwNDAwMDAwMFowbzELMAkGA1UEBhMCU0UxEjAQBgNVBAoMCVl1YmljbyBBQjEiMCAGA1UECwwZQXV0aGVudGljYXRvciBBdHRlc3RhdGlvbjEoMCYGA1UEAwwfWXViaWNvIFUyRiBFRSBTZXJpYWwgMTk1NTAwMzg0MjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJVd8633JH0xde_9nMTzGk6HjrrhgQlWYVD7OIsuX2Unv1dAmqWBpQ0KxS8YRFwKE1SKE1PIpOWacE5SO8BN6-2jbDBqMCIGCSsGAQQBgsQKAgQVMS4zLjYuMS40LjEuNDE0ODIuMS4xMBMGCysGAQQBguUcAgEBBAQDAgUgMCEGCysGAQQBguUcAQEEBBIEEPigEfOMCk0VgAYXER-e3H0wDAYDVR0TAQH_BAIwADANBgkqhkiG9w0BAQsFAAOCAQEAMVxIgOaaUn44Zom9af0KqG9J655OhUVBVW-q0As6AIod3AH5bHb2aDYakeIyyBCnnGMHTJtuekbrHbXYXERIn4aKdkPSKlyGLsA_A-WEi-OAfXrNVfjhrh7iE6xzq0sg4_vVJoywe4eAJx0fS-Dl3axzTTpYl71Nc7p_NX6iCMmdik0pAuYJegBcTckE3AoYEg4K99AM_JaaKIblsbFh8-3LxnemeNf7UwOczaGGvjS6UzGVI0Odf9lKcPIwYhuTxM5CaNMXTZQ7xq4_yTfC3kPWtE4hFT34UJJflZBiLrxG4OsYxkHw_n5vKgmpspB3GfYuYTWhkDKiE8CYtyg87mhhdXRoRGF0YVjE3PcEcSYqagziJNECYxSBKMR01J4pmySHIPPDM-42YdNBAAAAAAAAAAAAAAAAAAAAAAAAAAAAQG_jkwdob5C0DyOrfU5xbbdwa3o-9YXYv-m7RkoSuQwEBYNA4HWgPc64doYQPfpH51hKviKieGyKyudKgoOx0tWlAQIDJiABIVggJqHVYvUJM0ZuzlrZ3X98czBnZIKXf-6ijfFGDKqLACEiWCBPAxtczXxLIGHjjiag21Skr16YH8ajF9n7QwcNXhyx0A'
-yubico_security_key_att = Attestation.from_base64(yubico_security_key)
-print(yubico_security_key_att)
-
+print(websafe_decode(yubikey_4_client_data))
+yubikey_4_att = Attestation.from_base64(yubikey_4_attestation_obj)
+print(yubikey_4_att)
+yubikey_4_verified = md.verify_attestation(attestation=yubikey_4_att, client_data=websafe_decode(yubikey_4_client_data))
+print(f'fido2 U2F: {yubikey_4_verified}')
 
 yubikey_5_nfc_attestation_obj = 'o2NmbXRmcGFja2VkZ2F0dFN0bXSjY2FsZyZjc2lnWEgwRgIhAIRbB2kR7PfC27xsxNGePmQcKA_LIRaK0Q0HYX2kVPj5AiEAjL4P92FwUidaVAKfT_mSuH5v0maMshUMRtlxzJZ017RjeDVjgVkCwTCCAr0wggGloAMCAQICBB6PhzQwDQYJKoZIhvcNAQELBQAwLjEsMCoGA1UEAxMjWXViaWNvIFUyRiBSb290IENBIFNlcmlhbCA0NTcyMDA2MzEwIBcNMTQwODAxMDAwMDAwWhgPMjA1MDA5MDQwMDAwMDBaMG4xCzAJBgNVBAYTAlNFMRIwEAYDVQQKDAlZdWJpY28gQUIxIjAgBgNVBAsMGUF1dGhlbnRpY2F0b3IgQXR0ZXN0YXRpb24xJzAlBgNVBAMMHll1YmljbyBVMkYgRUUgU2VyaWFsIDUxMjcyMjc0MDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKh5-CM47RSUusBwS8x_xmPRsnFxWXYkMQHHYFEV18FSnigcHGcyLThLXNVd0-mBjV_YXCKvMm4MZPwgr-M_I2ajbDBqMCIGCSsGAQQBgsQKAgQVMS4zLjYuMS40LjEuNDE0ODIuMS43MBMGCysGAQQBguUcAgEBBAQDAgQwMCEGCysGAQQBguUcAQEEBBIEEC_AV5-BE0fqsRa7Wo25ICowDAYDVR0TAQH_BAIwADANBgkqhkiG9w0BAQsFAAOCAQEAhpP_Yt8NV3nUdI1_yNECJzGKjlgOajpXwQjpTgPDhWizZolPzlYkvko-_X80EYs9mTdD95KhmJFgyPya4LBOPfnuFePojAT8gqjcv1gY4QjcwpaFd655_2YrlHNOPexFlzBdc-blXuK-uc2WeMoJNeUz62OPjib6u4F82kQfvpgxgyrl9uKtmS-eu9tMYiOLj416tIHW0yY7zb-eSldVA3CYitWBNED6AyyttnI8rdj417qAn3W0PP-gpbmt0UIy752eFIEmOCM8TKSoc7n4rJjjK6GRZ2BuFZCfzdtKLf-9rkYgJJ-aZkasgeSDLREZ_r-qcxqILaJad4J9RtGQF2hhdXRoRGF0YVjE3PcEcSYqagziJNECYxSBKMR01J4pmySHIPPDM-42YdNBAAAAAS_AV5-BE0fqsRa7Wo25ICoAQDjqf6lUSwig_VinV7E7AHW5-gRqhriPK_Z08Am10wQyl5n6uZ7yWrmNKMd3ASnTuQLZJBQ87gmnVg4N7AU6e1qlAQIDJiABIVggy6WcmMhq0lbHKQMCpHf8D2dczddOstIL5Uld0xzu5Z0iWCD5mY6aAZFwPV-KnwpPi7oiP22CGfqiOvLnLTt9RCCYuA'
 yubikey_5_nfc_client_data = 'eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiMlpLQ1NDMWRCOU1CbnBqWGZoLXhYNDBmM3dCXzFCLXM1U0hEMFlNU001QSIsIm9yaWdpbiI6Imh0dHBzOi8vZGFzaGJvYXJkLmVkdWlkLmRvY2tlciIsImNyb3NzT3JpZ2luIjpmYWxzZX0'
@@ -244,13 +233,14 @@ yubikey_5_nfc_verified = md.verify_attestation(
 )
 print(f'yubikey_5_nfc: {yubikey_5_nfc_verified}')
 
-iphone_attestation_object = 'o2NmbXRlYXBwbGVnYXR0U3RtdKFjeDVjglkCRjCCAkIwggHJoAMCAQICBgGAA5HWJDAKBggqhkjOPQQDAjBIMRwwGgYDVQQDDBNBcHBsZSBXZWJBdXRobiBDQSAxMRMwEQYDVQQKDApBcHBsZSBJbmMuMRMwEQYDVQQIDApDYWxpZm9ybmlhMB4XDTIyMDQwNjEwMjg1MFoXDTIyMDQwOTEwMjg1MFowgZExSTBHBgNVBAMMQGMwNTg5OGNhNTUwMThiMmJkNzI0YzU4NjQ3ZDBkYTczMzlkYjY2MTdhZWU0NzY4OTliMmU4ZTJmMWFhYTAwYWYxGjAYBgNVBAsMEUFBQSBDZXJ0aWZpY2F0aW9uMRMwEQYDVQQKDApBcHBsZSBJbmMuMRMwEQYDVQQIDApDYWxpZm9ybmlhMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEWAO-hvjy7UiAR1hniqYu6Ssa8CFRu1F_UXtByeuhgnU9QBJ0FahxJR2FqTj6yMLRrOAEDjch-JEIxOzaJj2i2KNVMFMwDAYDVR0TAQH_BAIwADAOBgNVHQ8BAf8EBAMCBPAwMwYJKoZIhvdjZAgCBCYwJKEiBCDZbFxjinp9DpyOE8E4vmgndGsjMDRJahM1WHHzdN1V4TAKBggqhkjOPQQDAgNnADBkAjBV-Px342-7WTPTyOIr4PfqZAVvEvhbREKLCx2q6F7icGxCZoD5wroStrCM9Ot3UhQCME5XzY_4MsVejH-XF15jbgPoYdKw4HGjRNx6agX4VwIcgkEFk08XpdmpLTiESOrsc1kCODCCAjQwggG6oAMCAQICEFYlU5XHp_tA6-Io2CYIU7YwCgYIKoZIzj0EAwMwSzEfMB0GA1UEAwwWQXBwbGUgV2ViQXV0aG4gUm9vdCBDQTETMBEGA1UECgwKQXBwbGUgSW5jLjETMBEGA1UECAwKQ2FsaWZvcm5pYTAeFw0yMDAzMTgxODM4MDFaFw0zMDAzMTMwMDAwMDBaMEgxHDAaBgNVBAMME0FwcGxlIFdlYkF1dGhuIENBIDExEzARBgNVBAoMCkFwcGxlIEluYy4xEzARBgNVBAgMCkNhbGlmb3JuaWEwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAASDLocvJhSRgQIlufX81rtjeLX1Xz_LBFvHNZk0df1UkETfm_4ZIRdlxpod2gULONRQg0AaQ0-yTREtVsPhz7_LmJH-wGlggb75bLx3yI3dr0alruHdUVta-quTvpwLJpGjZjBkMBIGA1UdEwEB_wQIMAYBAf8CAQAwHwYDVR0jBBgwFoAUJtdk2cV4wlpn0afeaxLQG2PxxtcwHQYDVR0OBBYEFOuugsT_oaxbUdTPJGEFAL5jvXeIMA4GA1UdDwEB_wQEAwIBBjAKBggqhkjOPQQDAwNoADBlAjEA3YsaNIGl-tnbtOdle4QeFEwnt1uHakGGwrFHV1Azcifv5VRFfvZIlQxjLlxIPnDBAjAsimBE3CAfz-Wbw00pMMFIeFHZYO1qdfHrSsq-OM0luJfQyAW-8Mf3iwelccboDgdoYXV0aERhdGFYmMY-yg23lncBLbnB_IQLgUnhjmcR07HUho1A5EcRGCzCRQAAAADySo5w0NP4LCk3MlI8xN5aABT5M6rzbtbX60djPMKeuG81NQaRzqUBAgMmIAEhWCBYA76G-PLtSIBHWGeKpi7pKxrwIVG7UX9Re0HJ66GCdSJYID1AEnQVqHElHYWpOPrIwtGs4AQONyH4kQjE7NomPaLY'
-iphone_client_data_json = 'eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiRzdGS1l4NmVrZF9NcTJWVW9GcURObV84RmxvYUJJSEZaZE9saXZUcDlXYyIsIm9yaWdpbiI6Imh0dHBzOi8vZGFzaGJvYXJkLmRldi5lZHVpZC5zZSJ9'
-iphone_anonymous_att = Attestation.from_base64(iphone_attestation_object)
-iphone_verified = md.verify_attestation(
-    attestation=iphone_anonymous_att, client_data=websafe_decode(iphone_client_data_json)
-)
-print(f'iphone: {iphone_verified}')
+# XXX: iphone authenticator cert is valid for three days
+# iphone_attestation_object = 'o2NmbXRlYXBwbGVnYXR0U3RtdKFjeDVjglkCRjCCAkIwggHJoAMCAQICBgGAA5HWJDAKBggqhkjOPQQDAjBIMRwwGgYDVQQDDBNBcHBsZSBXZWJBdXRobiBDQSAxMRMwEQYDVQQKDApBcHBsZSBJbmMuMRMwEQYDVQQIDApDYWxpZm9ybmlhMB4XDTIyMDQwNjEwMjg1MFoXDTIyMDQwOTEwMjg1MFowgZExSTBHBgNVBAMMQGMwNTg5OGNhNTUwMThiMmJkNzI0YzU4NjQ3ZDBkYTczMzlkYjY2MTdhZWU0NzY4OTliMmU4ZTJmMWFhYTAwYWYxGjAYBgNVBAsMEUFBQSBDZXJ0aWZpY2F0aW9uMRMwEQYDVQQKDApBcHBsZSBJbmMuMRMwEQYDVQQIDApDYWxpZm9ybmlhMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEWAO-hvjy7UiAR1hniqYu6Ssa8CFRu1F_UXtByeuhgnU9QBJ0FahxJR2FqTj6yMLRrOAEDjch-JEIxOzaJj2i2KNVMFMwDAYDVR0TAQH_BAIwADAOBgNVHQ8BAf8EBAMCBPAwMwYJKoZIhvdjZAgCBCYwJKEiBCDZbFxjinp9DpyOE8E4vmgndGsjMDRJahM1WHHzdN1V4TAKBggqhkjOPQQDAgNnADBkAjBV-Px342-7WTPTyOIr4PfqZAVvEvhbREKLCx2q6F7icGxCZoD5wroStrCM9Ot3UhQCME5XzY_4MsVejH-XF15jbgPoYdKw4HGjRNx6agX4VwIcgkEFk08XpdmpLTiESOrsc1kCODCCAjQwggG6oAMCAQICEFYlU5XHp_tA6-Io2CYIU7YwCgYIKoZIzj0EAwMwSzEfMB0GA1UEAwwWQXBwbGUgV2ViQXV0aG4gUm9vdCBDQTETMBEGA1UECgwKQXBwbGUgSW5jLjETMBEGA1UECAwKQ2FsaWZvcm5pYTAeFw0yMDAzMTgxODM4MDFaFw0zMDAzMTMwMDAwMDBaMEgxHDAaBgNVBAMME0FwcGxlIFdlYkF1dGhuIENBIDExEzARBgNVBAoMCkFwcGxlIEluYy4xEzARBgNVBAgMCkNhbGlmb3JuaWEwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAASDLocvJhSRgQIlufX81rtjeLX1Xz_LBFvHNZk0df1UkETfm_4ZIRdlxpod2gULONRQg0AaQ0-yTREtVsPhz7_LmJH-wGlggb75bLx3yI3dr0alruHdUVta-quTvpwLJpGjZjBkMBIGA1UdEwEB_wQIMAYBAf8CAQAwHwYDVR0jBBgwFoAUJtdk2cV4wlpn0afeaxLQG2PxxtcwHQYDVR0OBBYEFOuugsT_oaxbUdTPJGEFAL5jvXeIMA4GA1UdDwEB_wQEAwIBBjAKBggqhkjOPQQDAwNoADBlAjEA3YsaNIGl-tnbtOdle4QeFEwnt1uHakGGwrFHV1Azcifv5VRFfvZIlQxjLlxIPnDBAjAsimBE3CAfz-Wbw00pMMFIeFHZYO1qdfHrSsq-OM0luJfQyAW-8Mf3iwelccboDgdoYXV0aERhdGFYmMY-yg23lncBLbnB_IQLgUnhjmcR07HUho1A5EcRGCzCRQAAAADySo5w0NP4LCk3MlI8xN5aABT5M6rzbtbX60djPMKeuG81NQaRzqUBAgMmIAEhWCBYA76G-PLtSIBHWGeKpi7pKxrwIVG7UX9Re0HJ66GCdSJYID1AEnQVqHElHYWpOPrIwtGs4AQONyH4kQjE7NomPaLY'
+# iphone_client_data_json = 'eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiRzdGS1l4NmVrZF9NcTJWVW9GcURObV84RmxvYUJJSEZaZE9saXZUcDlXYyIsIm9yaWdpbiI6Imh0dHBzOi8vZGFzaGJvYXJkLmRldi5lZHVpZC5zZSJ9'
+# iphone_anonymous_att = Attestation.from_base64(iphone_attestation_object)
+# iphone_verified = md.verify_attestation(
+#    attestation=iphone_anonymous_att, client_data=websafe_decode(iphone_client_data_json)
+# )
+# print(f'iphone: {iphone_verified}')
 
 
 tpm_attestation_object = 'o2NmbXRjdHBtZ2F0dFN0bXSmY2FsZzn__mNzaWdZAQADKC9cEAtzensGrFGu1yxc9b-MXY-ypayZ1XK-ccAURoqwM8mdCqZ9IvCwskTlRZwnIIlKAPDHejenmoJNLcarMmYAZH9iEj6iuXHjkpjRdVQ_kTsGntT_L8XStSafstiK2WMkyAnxK0E4Dg-i6Mzy_93Uoz0qM8MmZVjrbR3QEEmmuVkLTQ7_QsfId2b3GbdtP-17T7rboUHnhtb-e5CQrcZFNgHeclC1KN1Z9TTM1Tw4p2GZUXYODD-Cx5LZ9nta4vlwx6zaU__RLfjFy4891Jvn9c15H_k8a_S3i4bUn7hUhgQHsNdRVBoYGOU43C3TFuqlvVPsCO56TD3sJV8_Y3ZlcmMyLjBjeDVjglkFtTCCBbEwggOZoAMCAQICED0bYHWxrkPymzCD2iNuX74wDQYJKoZIhvcNAQELBQAwQTE_MD0GA1UEAxM2RVVTLU5UQy1LRVlJRC0xNTkxRDRCNkVBRjk4RDAxMDQ4NjRCNjkwM0E0OEREMDAyNjA3N0QzMB4XDTIxMTExNjA4NTcyMVoXDTI3MDYwMzE3NTE0OVowADCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANHM9NQdZwbri22CtYkLJ4HftI9Op2mO1mEc35VWI384Su8QDH9YItYoJnEi-4QS-fPca9T1Ssdf0QnkIKBbb8BaoxbuMucnPoK9BvOR9UBcTBvpFkjkBb1b880HF2Eti6oIyiP92oGyUBCQVmMEjcZIXI1i2T0U8RKnEsjTyG3AwxVvjoSwWwqRhCNC3ZGvtGTEJ2Tz2Gv8PjUMFSI4_1J9_niuEJpeYMJHLZjtcxE6lYObh-enbscsHpcsN5qeAxn3fdAiS8pxUanT-sZdYxEDzip-PRoafT3b7T5DdAm8gIJ0_uooh60dK_6JED6C0eeNrCJcZzD2uIfel6AZ1t0CAwEAAaOCAeQwggHgMA4GA1UdDwEB_wQEAwIHgDAMBgNVHRMBAf8EAjAAMG0GA1UdIAEB_wRjMGEwXwYJKwYBBAGCNxUfMFIwUAYIKwYBBQUHAgIwRB5CAFQAQwBQAEEAIAAgAFQAcgB1AHMAdABlAGQAIAAgAFAAbABhAHQAZgBvAHIAbQAgACAASQBkAGUAbgB0AGkAdAB5MBAGA1UdJQQJMAcGBWeBBQgDMEoGA1UdEQEB_wRAMD6kPDA6MTgwDgYFZ4EFAgMMBWlkOjEzMBAGBWeBBQICDAdOUENUNnh4MBQGBWeBBQIBDAtpZDo0RTU0NDMwMDAfBgNVHSMEGDAWgBR27Ef3V-wqXtQOHZgCXhTLKFHirTAdBgNVHQ4EFgQUFtCPLIh2MHWSt8ofBNmKmu6LIAkwgbIGCCsGAQUFBwEBBIGlMIGiMIGfBggrBgEFBQcwAoaBkmh0dHA6Ly9hemNzcHJvZGV1c2Fpa3B1Ymxpc2guYmxvYi5jb3JlLndpbmRvd3MubmV0L2V1cy1udGMta2V5aWQtMTU5MWQ0YjZlYWY5OGQwMTA0ODY0YjY5MDNhNDhkZDAwMjYwNzdkMy83ZDJlOWRhMC1mZDhjLTQwY2QtODQxMC0wNGNiMDMyZTAwYWMuY2VyMA0GCSqGSIb3DQEBCwUAA4ICAQAs7jfTufKDlnLNHUhv59U-MEWvhcfQshDwAvmO7oNWG73Y5Moah0Ki7SczPglvgAvmmTNWKqBcP9ll-SLdGD-qkDYTNJqG0DUsEt9ngdR7_4ZpwOsJCvt_SNg44fESU3d8nTsXGkwfbuyODPH-C_yk85LM0Pnf3q-SxZBINqe-XhvIkK7jWdgj2SHM6vcpvaD4ohpNhe1JFTqGXl4BVOplzy43Vc-vERXD_YAbmXTnMD-RUZC4JjC_hbHMEgxHHwTlTxg_HuqL-rA33-N1ligUQ_vKxrCqJ4XSP3svEDAh72_2ljyPPxO56ZT4DA8y1zWAQxRcG58VArA4MxjT7o8GbGVokcdYJOvD62NbpG9IuRQb763sCZmn_n893dyneX09H6jm97S86S0dghLyx45FHesUueW_ZZMS0xRVKQuTYjv58JDosNYHwvbeDZZlmxQnOaU6usuZoDTHZXPzvMU5m9r6vGpUvrYPSyupK90qOgW61_YLrqXw3naF3-E_vvVKSiiIhCpo6R3lh066kKkDnYL35-OGrODuwTdytmOAF8G1YpH__S4JMcYWu0Bc-HXysH2TqyYu_-_MRVtacTkdrbehdo3x0C_ztQJEXPfZB1f4BzharRrgpJcG5D9s4FMTK0yQRzmTMVwITm8jselKddHbdJHoI5BPvVsQf1AxSVkG7zCCBuswggTToAMCAQICEzMAAAQJFK8U1c8A0ecAAAAABAkwDQYJKoZIhvcNAQELBQAwgYwxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xNjA0BgNVBAMTLU1pY3Jvc29mdCBUUE0gUm9vdCBDZXJ0aWZpY2F0ZSBBdXRob3JpdHkgMjAxNDAeFw0yMTA2MDMxNzUxNDlaFw0yNzA2MDMxNzUxNDlaMEExPzA9BgNVBAMTNkVVUy1OVEMtS0VZSUQtMTU5MUQ0QjZFQUY5OEQwMTA0ODY0QjY5MDNBNDhERDAwMjYwNzdEMzCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAN3VCjjVBxjmREHAXozpqTk8eet-ELA8kLt3vjfq0RUNP84ZA6KZqi88zN1EplbJVdGU1IqCHksjBpcPkE6S8SfuLjYMTFxO98ggWCSUSf5dY_tPD2gbvGw1yQw6FwiN3f9ezRulX0iHFx7RDZSio1nG0W6OeSKXAn2NkTn_8KTT2-WrnyCu-Y2pRAtZTV4a0slUzDdL8AOtusJvDdcXktQXLgiIWowLYqv_QRrQCf3mrO-zs7cX9pRF67DkvFljG_79BfZ8W8xv7V1cWsDmFoEZJhBoSyURvgiG0EF6GWvSY1kMwOOPP6JhYh7xj4rhLgf4nuA4si2R6lx1yCWcJq5H6FJ4yNQ2gzhyS-a897T38fJJSHsSZIEWl-y3uwV0SU9rE_92g6VHoxRQfM8R9gAl_DbsfIqJouva4BV0vgkyK1A1QP60iPzV-N0vjy5-bTlTdE9P4M0jyskNcex-ndUvryXvUHhrqgn-dGszHXND-ul3D3-y9MFBxWOtyTwQaZeNkKur-IRXnaDtGNPr7fmnqbxEtLcUdl8nnzRdt1QRuJM4Q_cA2veq3abEAQzbk5HiRBt0tt7i4ua6egc5yIWaHbj0M9409Usi9vGmaCQB_4neZBRBCP5W6gjgK6U43W6Pwb8ugJO9rk_xlAi3BSjfxhaF8AHerzGRRd1rY_MpAgMBAAGjggGOMIIBijAOBgNVHQ8BAf8EBAMCAoQwGwYDVR0lBBQwEgYJKwYBBAGCNxUkBgVngQUIAzAWBgNVHSAEDzANMAsGCSsGAQQBgjcVHzASBgNVHRMBAf8ECDAGAQH_AgEAMB0GA1UdDgQWBBR27Ef3V-wqXtQOHZgCXhTLKFHirTAfBgNVHSMEGDAWgBR6jArOL0hiF-KU0a5VwVLscXSkVjBwBgNVHR8EaTBnMGWgY6Bhhl9odHRwOi8vd3d3Lm1pY3Jvc29mdC5jb20vcGtpb3BzL2NybC9NaWNyb3NvZnQlMjBUUE0lMjBSb290JTIwQ2VydGlmaWNhdGUlMjBBdXRob3JpdHklMjAyMDE0LmNybDB9BggrBgEFBQcBAQRxMG8wbQYIKwYBBQUHMAKGYWh0dHA6Ly93d3cubWljcm9zb2Z0LmNvbS9wa2lvcHMvY2VydHMvTWljcm9zb2Z0JTIwVFBNJTIwUm9vdCUyMENlcnRpZmljYXRlJTIwQXV0aG9yaXR5JTIwMjAxNC5jcnQwDQYJKoZIhvcNAQELBQADggIBAAlWh9LMUF_jXJILn6eLq7Ci3NR_wmkWTL3xArP3QdDrM9f0f3FWbrW-vW_bPZ-bWnvwHGs5acGOF70Pfay0nFnIgN7v4Ap2QSz8ZV1tT3G_FV7XVQn8DLrFZS0P-kwaj-mqOGyy_i3avfeTodEbY2md4aCmMks6pgA9_0cn2d6OBbFhUwmFRdSXyTgfLosZQ4ZM6jZOTcVS_AXTMKachTenOUsu4rq-mY6MEnZUDMJRO8etq1txBjfkzU0z_OBAUv1JbOyv8B6DiPtny4_b9YcCBVZDzeTbiuEpihjMOd9wVbLnGPfjqdpri1LfpBeb2NqU8-3Xzx2vC3IhGSL-MSWbYeegkeKC-VWVIrEdUPo7CYjRYmxixx7njE2WmWF-njjz0Ym6jI-42HhC8co0ZO8ShDX_TWzUIAkuTO_8XsNEgRx0O4FvYMvcUD7HCPAWmymGeRFulV26ew1ZVe8TbTuAutzAYWiAW_3us8eMgsgK-8RrTdA_4LgMG8cMjAFPPSE4pWnnKtMau09Kd6Bwby_JUf4Jzj3334Yy5MgRU8ZdKpIR7ttVJf9nYgOvgG2gZxlK1WkylOYgQ_cy_P_wd4c8fKIsmlwcLubz190MBjqYRrzVDiRv-ZvzfKmYNkzfmS0148quLg8bOonBPyO-NxHpmBkLO1RxTKsH9ROEjXPSZ3B1YkFyZWFZATYAAQALAAYEcgAgnf_L82w4OuaZ-5ho3G3LidcVOIS-KAOSLBJBWL-tIq4AEAAQCAAAAAAAAQDzbbse88SEq3l9_bklBUIPY9_zMoQS3MY2uKDIP5xBwev-fclctYhzqcbLfFXEKn6_hzTNgwcBgnk0gFhipAXdeZMF6KqRA-EP8tf8ADrPJVO9MIJlW4XBbX34yDlaRMGHWJkhMabvcl9vKXs_zKO-1Sb9477yaBkB5UY8MUc9DQfMGU-V7FYYgiTcxEzZ73AV1a8NPoGBkPqydB_x4izEOiLzhQHzZn3pw7hF3FsmCFPAhN2JVvySJwNrJ6uwCimcHGnHEB3LudUOPxU8gVKJCGG6DGowwYg6Xv3nr2Bx4wVtUQw7OjGGTdCHuTgXgRZJ1ZDNnY1KvDIQ-8Hpt6AbaGNlcnRJbmZvWKH_VENHgBcAIgALI7E9zE4hRG5gi5X8ZLOx1nBs5TR7o6Xw71F13vGQZz0AFHp1OQIvOLQ4sj6kUd_LwZzGOaSwAAAADQbAUv_smt0ontxTmAHHtCFXIAKHEQAiAAs5vYGEPFPXdHYZ6Aq9NCq_CAKTnsob15P2IM2R8VLkaAAiAAuFGYRlTgi5CMlz2ZQpoPguuB4VKNKMCAeEeFVebh5JrmhhdXRoRGF0YVkBZ8Y-yg23lncBLbnB_IQLgUnhjmcR07HUho1A5EcRGCzCRQAAAAAImHBYytxLgbbhMN5Q3L6WACBc1Q_SupD21PWprh4LkrZmkeuGnespu_71rFtW8GMJxaQBAwM5AQAgWQEA8227HvPEhKt5ff25JQVCD2Pf8zKEEtzGNrigyD-cQcHr_n3JXLWIc6nGy3xVxCp-v4c0zYMHAYJ5NIBYYqQF3XmTBeiqkQPhD_LX_AA6zyVTvTCCZVuFwW19-Mg5WkTBh1iZITGm73Jfbyl7P8yjvtUm_eO-8mgZAeVGPDFHPQ0HzBlPlexWGIIk3MRM2e9wFdWvDT6BgZD6snQf8eIsxDoi84UB82Z96cO4RdxbJghTwITdiVb8kicDayersAopnBxpxxAdy7nVDj8VPIFSiQhhugxqMMGIOl79569gceMFbVEMOzoxhk3Qh7k4F4EWSdWQzZ2NSrwyEPvB6begGyFDAQAB'
@@ -261,3 +251,13 @@ tpm_att = Attestation.from_base64(tpm_attestation_object)
 print(tpm_att)
 tpm_verified = md.verify_attestation(attestation=tpm_att, client_data=websafe_decode(tpm_client_data))
 print(f'tpm: {tpm_verified}')
+
+
+android_client_data = 'eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiOS1Uak5pOGotcF9IUWtsaFZLbzlJY00yY2p4WDF4NW8wanFWX21PZW5kUSIsIm9yaWdpbiI6Imh0dHBzOlwvXC9kYXNoYm9hcmQuZGV2LmVkdWlkLnNlIiwiYW5kcm9pZFBhY2thZ2VOYW1lIjoiY29tLmFuZHJvaWQuY2hyb21lIn0'
+android_credential_id = 'ASmVBgIZCeh_5YODVLV1MMi3YrFPeqqVN8FNOBdLRKrh9sojyUYDfo3M1hIbAsCc_L1E2Umvjv6lw2piTs7ZQkY'
+android_attestation_object = 'o2NmbXRxYW5kcm9pZC1zYWZldHluZXRnYXR0U3RtdKJjdmVyaTIxMzYxNDAxOWhyZXNwb25zZVkgd2V5SmhiR2NpT2lKU1V6STFOaUlzSW5nMVl5STZXeUpOU1VsR1ltcERRMEpHWVdkQmQwbENRV2RKVVVGaE0wOUxUMlJ2VkZrMFVVRkJRVUZCUVROWVdFUkJUa0puYTNGb2EybEhPWGN3UWtGUmMwWkJSRUpIVFZGemQwTlJXVVJXVVZGSFJYZEtWbFY2UldsTlEwRkhRVEZWUlVOb1RWcFNNamwyV2pKNGJFbEdVbmxrV0U0d1NVWk9iR051V25CWk1sWjZTVVY0VFZGNlJWUk5Ra1ZIUVRGVlJVRjRUVXRTTVZKVVNVVk9Ra2xFUmtWT1JFRmxSbmN3ZVUxcVFYcE5ha0Y1VFZSRk1VMXFSbUZHZHpCNVRXcEJNazFVWjNsTlZFVXhUV3BDWVUxQ01IaEhla0ZhUW1kT1ZrSkJUVlJGYlVZd1pFZFdlbVJETldoaWJWSjVZakpzYTB4dFRuWmlWRU5EUVZOSmQwUlJXVXBMYjFwSmFIWmpUa0ZSUlVKQ1VVRkVaMmRGVUVGRVEwTkJVVzlEWjJkRlFrRk1iWEZNUWxoV05FTmFRVFZ6VkRWalZHWjFXR04zTVRGWFJESlpWVmN6WlVGS2RtUnhLMWhKWWtoRVowMU9UVUp5YzNndldFUjROa3h0T1U5dFNrTlZOSFpEY0ZkSlRqUlhRMGd5TUZRNVQyWmxOa2hrZVU1MlJXVnBNM3BvYkhwT01Gb3ZXVlI1YjFSbGNGZHdOVWd2YlhKdVIyOXpVM050Y0VwMU5EVjNPVkpZYm01S2JFbHJSelU1ZEROMFYxSm9ZWE5aWlc1R1kwaGxZMFpvYkcxb2RtNVVRblJIYTAxVmIwVkdSRVpuYW5sdFoydHdVVWRrTW14b2FVOVlXR0p3TXpFMVNYbEdiRWRVVkZwdk5FUkJZVFppTUhwMlZHWlFPWFY2UjFGSlpIaG1hM041VFVsR1ptSkRZVmQ2VGpOUGFuQjFiVkl3TUhnMlNWWmpaRGR5T1V4dk9WQmxWV3c1YTI5NmNqaEZhRFJEV1M5UFFpdEVPVkV2VmpaNFJWcGlWSE5IZVhjMGFVRnhRMHR2TVRSRFJYcERSVkZJTUVaV1dUUTFjRmczYjJJcmJXaG1MMXBLYldOekwwMTRibFpHYmt4NmJEQkRRWGRGUVVGaFQwTkJiamgzWjJkS04wMUJORWRCTVZWa1JIZEZRaTkzVVVWQmQwbEdiMFJCVkVKblRsWklVMVZGUkVSQlMwSm5aM0pDWjBWR1FsRmpSRUZVUVUxQ1owNVdTRkpOUWtGbU9FVkJha0ZCVFVJd1IwRXhWV1JFWjFGWFFrSlVPVkkzWjIxUFpVUXhkbHBSVmtOSVl6QlVkR2gyVDFscE16bEVRV1pDWjA1V1NGTk5SVWRFUVZkblFsRnNOR2huVDNOc1pWSnNRM0pzTVVZeVIydEpVR1ZWTjA4MGEycENOMEpuWjNKQ1owVkdRbEZqUWtGUlVuWk5SekIzVDBGWlNVdDNXVUpDVVZWSVRVRkhSMHhIYURCa1NFRTJUSGs1ZGxrelRuZE1ia0p5WVZNMWJtSXlPVzVNTTAxMldqTlNlazFYVVRCaFZ6VXdURE5vVDB4V09IZGtSRTR6VjFScmQwMUVSVWREUTNOSFFWRlZSa0o2UVVOb2FWWnZaRWhTZDA5cE9IWmpSM1J3VEcxa2RtSXlZM1pqYlZaM1luazVhbHBZU2pCamVUbHVaRWhOZUZwRVVYVmFSMVo1VFVJd1IwRXhWV1JGVVZGWFRVSlRRMFZ0UmpCa1IxWjZaRU0xYUdKdFVubGlNbXhyVEcxT2RtSlVRV2hDWjA1V1NGTkJSVWRxUVZsTlFXZEhRbTFsUWtSQlJVTkJWRUZOUW1kdmNrSm5SVVZCWkZvMVFXZFZSRTFFT0VkQk1WVmtTSGRSTkUxRVdYZE9TMEY1YjBSRFIweHRhREJrU0VFMlRIazVhbU50ZUhwTWJrSnlZVk0xYm1JeU9XNU1NbVF3WTNwR2EwNUhiSFZrUXpsWlRXdHZlVk5JU21aT01VSndWRk0xYW1OdGQzZG5aMFZGUW1kdmNrSm5SVVZCWkZvMVFXZFJRMEpKU0RGQ1NVaDVRVkJCUVdSblFsSnZOMFF4TDFGR05XNUdXblIxUkdRMGFuZDVhMlZ6ZDJKS09IWXpibTlvUTIxbk15c3hTWE5HTlZGQlFVRllLM0JhYTBweVFVRkJSVUYzUWtoTlJWVkRTVkZEYjJSV1JucFBRMVZ1YkhWUlV6QjBNRzlIZFVFemRsWkZSMFp4YjJJNFNWSmlRM0JaZVRkVlptTkJVVWxuUmk5TlpWVlNkRzlFTjFGcmFGaENUakIxY21sRGRFd3ZURU5zTVcxelJFNW9XakZ0TVVoS2VFcFJiMEZrWjBGd1pXSTNkMjVxYXpWSlprSlhZelU1YW5CWVpteDJiR1E1YmtkQlN5dFFiRTVZVTFwalNsWXpTR2hCUVVGQldDdHdXbXRLV1VGQlFVVkJkMEpJVFVWVlEwbFJRMXB2UlcxQmJ6YzBVaXRHVDBwUWVWSkxZa2t5UlNzMlMwTllOa0YxV0cxb1puTlhhMmgwYVVGTFlXZEpaMXAxZG1aSWNVRTJVRTlzTTBKa1YzUmxVMWw0VHpBMlFtTndUM2RVWVRWNk5qVnFTa3cwZEV4RWNrbDNSRkZaU2t0dldrbG9kbU5PUVZGRlRFSlJRVVJuWjBWQ1FVUkpjQzkzYmxGc1puRTNkVlo2ZERVM01IbFJSVEpPUVZBMWFqaDVPR0Z6V1doS1RYY3JVVEJZWjNNMmEzcHFabnBHTDJnM09WcG1SbGhMT1RoM1FWSmhWbkkyYW1WU1FYbzJZM0U0Y1VWSU1VOHlRa1E1ZURWRVEwOVVaekp4Y2xOblNsZGlUVTVWV2tSNVRYVjZSbVZ5UTJFeU56bG9Ra2xRVlhCcU56ZzBZVWRzWVdwNFkyTTNWSFJZU0hwYWNuaG1iR00wZDFCeloySm5RMnR3ZDNWcU5tb3dhbmRETmpkUk5HSnJPVlZZS3pOeGNHdzNNbUZLTW5wV2J6Rm1UMnMzVTBad1NUVTRSak5KTDFjNGJra3ZhMk53YjFCdmNESkNOa294UjNSeFRVUklSbkJ5YzNSblpVcE1iRmt6UVdWbVpXb3llVzlGZDNVeWFqSXJZekV2U2paM1NEVjRZV1JFUzNobk0wNTJhRElyZUdoYVVrWmFiMEZVWWpKbE5sbHplRFJTTUVKMGVXVllORWhhVFdjME9GRmhRazQwTjJ4QmVFRmpaelIxWVZOcVJ5OHZRa2hYVGpNMGNFMUZZV05KZUVkT01EMGlMQ0pOU1VsR2FrUkRRMEV6VTJkQmQwbENRV2RKVGtGblEwOXpaMGw2VG0xWFRGcE5NMkp0ZWtGT1FtZHJjV2hyYVVjNWR6QkNRVkZ6UmtGRVFraE5VWE4zUTFGWlJGWlJVVWRGZDBwV1ZYcEZhVTFEUVVkQk1WVkZRMmhOV2xJeU9YWmFNbmhzU1VaU2VXUllUakJKUms1c1kyNWFjRmt5Vm5wSlJYaE5VWHBGVlUxQ1NVZEJNVlZGUVhoTlRGSXhVbFJKUmtwMllqTlJaMVZxUlhkSWFHTk9UV3BCZDA5RVJYcE5SRUYzVFVSUmVWZG9ZMDVOYW1OM1QxUk5kMDFFUVhkTlJGRjVWMnBDUjAxUmMzZERVVmxFVmxGUlIwVjNTbFpWZWtWcFRVTkJSMEV4VlVWRGFFMWFVakk1ZGxveWVHeEpSbEo1WkZoT01FbEdUbXhqYmxwd1dUSldla2xGZUUxUmVrVlVUVUpGUjBFeFZVVkJlRTFMVWpGU1ZFbEZUa0pKUkVaRlRrUkRRMEZUU1hkRVVWbEtTMjlhU1doMlkwNUJVVVZDUWxGQlJHZG5SVkJCUkVORFFWRnZRMmRuUlVKQlMzWkJjWEZRUTBVeU4yd3dkemw2UXpoa1ZGQkpSVGc1WWtFcmVGUnRSR0ZITjNrM1ZtWlJOR01yYlU5WGFHeFZaV0pWVVhCTE1IbDJNbkkyTnpoU1NrVjRTekJJVjBScVpYRXJia3hKU0U0eFJXMDFhalp5UVZKYWFYaHRlVkpUYW1oSlVqQkxUMUZRUjBKTlZXeGtjMkY2ZEVsSlNqZFBNR2N2T0RKeGFpOTJSMFJzTHk4emREUjBWSEY0YVZKb1RGRnVWRXhZU21SbFFpc3lSR2hyWkZVMlNVbG5lRFozVGpkRk5VNWpWVWd6VW1OelpXcGpjV280Y0RWVGFqRTVka0p0Tm1reFJtaHhURWQ1YldoTlJuSnZWMVpWUjA4emVIUkpTRGt4WkhObmVUUmxSa3RqWmt0V1RGZExNMjh5TVRrd1VUQk1iUzlUYVV0dFRHSlNTalZCZFRSNU1XVjFSa3B0TWtwTk9XVkNPRFJHYTNGaE0ybDJjbGhYVldWV2RIbGxNRU5SWkV0MmMxa3lSbXRoZW5aNGRIaDJkWE5NU25wTVYxbElhelUxZW1OU1FXRmpSRUV5VTJWRmRFSmlVV1pFTVhGelEwRjNSVUZCWVU5RFFWaFpkMmRuUm5sTlFUUkhRVEZWWkVSM1JVSXZkMUZGUVhkSlFtaHFRV1JDWjA1V1NGTlZSVVpxUVZWQ1oyZHlRbWRGUmtKUlkwUkJVVmxKUzNkWlFrSlJWVWhCZDBsM1JXZFpSRlpTTUZSQlVVZ3ZRa0ZuZDBKblJVSXZkMGxDUVVSQlpFSm5UbFpJVVRSRlJtZFJWVXBsU1ZsRWNrcFlhMXBSY1RWa1VtUm9jRU5FTTJ4UGVuVktTWGRJZDFsRVZsSXdha0pDWjNkR2IwRlZOVXM0Y2twdVJXRkxNR2R1YUZNNVUxcHBlblk0U1d0VVkxUTBkMkZCV1VsTGQxbENRbEZWU0VGUlJVVllSRUpoVFVOWlIwTkRjMGRCVVZWR1FucEJRbWhvY0c5a1NGSjNUMms0ZG1JeVRucGpRelYzWVRKcmRWb3lPWFphZVRsdVpFaE9lVTFVUVhkQ1oyZHlRbWRGUmtKUlkzZEJiMWxyWVVoU01HTkViM1pNTTBKeVlWTTFibUl5T1c1TU0wcHNZMGM0ZGxreVZubGtTRTEyV2pOU2VtTnFSWFZhUjFaNVRVUlJSMEV4VldSSWQxRjBUVU56ZDB0aFFXNXZRMWRIU1RKb01HUklRVFpNZVRscVkyMTNkV05IZEhCTWJXUjJZakpqZGxvelVucGpha1YyV2pOU2VtTnFSWFZaTTBwelRVVXdSMEV4VldSSlFWSkhUVVZSZDBOQldVZGFORVZOUVZGSlFrMUVaMGREYVhOSFFWRlJRakZ1YTBOQ1VVMTNTMnBCYjBKblozSkNaMFZHUWxGalEwRlNXV05oU0ZJd1kwaE5Oa3g1T1hkaE1tdDFXakk1ZGxwNU9YbGFXRUoyWXpKc01HSXpTalZNZWtGT1FtZHJjV2hyYVVjNWR6QkNRVkZ6UmtGQlQwTkJaMFZCU1ZaVWIza3lOR3AzV0ZWeU1ISkJVR001TWpSMmRWTldZa3RSZFZsM00yNU1abXhNWmt4b05VRlpWMFZsVm13dlJIVXhPRkZCVjFWTlpHTktObTh2Y1VaYVltaFlhMEpJTUZCT1kzYzVOM1JvWVdZeVFtVnZSRmxaT1VOckwySXJWVWRzZFdoNE1EWjZaRFJGUW1ZM1NEbFFPRFJ1Ym5KM2NGSXJORWRDUkZwTEsxaG9NMGt3ZEhGS2VUSnlaMDl4VGtSbWJISTFTVTFST0ZwVVYwRXplV3gwWVd0NlUwSkxXalpZY0VZd1VIQnhlVU5TZG5BdlRrTkhkakpMV0RKVWRWQkRTblp6WTNBeEwyMHljRlpVZEhsQ2FsbFFVbEVyVVhWRFVVZEJTa3RxZEU0M1VqVkVSbkptVkhGTlYzWlpaMVpzY0VOS1FtdDNiSFUzS3pkTFdUTmpWRWxtZWtVM1kyMUJUSE5yVFV0T1RIVkVlaXRTZWtOamMxbFVjMVpoVlRkV2NETjRURFl3VDFsb2NVWnJkVUZQVDNoRVdqWndTRTlxT1N0UFNtMVpaMUJ0VDFRMFdETXJOMHcxTVdaWVNubFNTRGxMWmt4U1VEWnVWRE14UkRWdWJYTkhRVTluV2pJMkx6aFVPV2h6UWxjeGRXODVhblUxWmxwTVdsaFdWbE0xU0RCSWVVbENUVVZMZVVkTlNWQm9SbGR5YkhRdmFFWlRNamhPTVhwaFMwa3dXa0pIUkRObldXZEVUR0pwUkZRNVprZFljM1J3YXl0R2JXTTBiMnhXYkZkUWVsaGxPREYyWkc5RmJrWmljalZOTWpjeVNHUm5TbGR2SzFkb1ZEbENXVTB3U21rcmQyUldiVzVTWm1aWVoyeHZSVzlzZFZST1kxZDZZelF4WkVad1owcDFPR1pHTTB4SE1HZHNNbWxpVTFscFEyazVZVFpvZGxVd1ZIQndha3A1U1ZkWWFHdEtWR05OU214UWNsZDRNVlo1ZEVWVlIzSllNbXd3U2tSM1VtcFhMelkxTm5Jd1MxWkNNREo0U0ZKTGRtMHlXa3RKTUROVVoyeE1TWEJ0VmtOTE0ydENTMnRMVG5CQ1RtdEdkRGh5YUdGbVkwTkxUMkk1U25ndk9YUndUa1pzVVZSc04wSXpPWEpLYkVwWGExSXhOMUZ1V25GV2NIUkdaVkJHVDFKdldtMUdlazA5SWl3aVRVbEpSbGxxUTBOQ1JYRm5RWGRKUWtGblNWRmtOekJPWWs1ek1pdFNjbkZKVVM5Rk9FWnFWRVJVUVU1Q1oydHhhR3RwUnpsM01FSkJVWE5HUVVSQ1dFMVJjM2REVVZsRVZsRlJSMFYzU2tOU1ZFVmFUVUpqUjBFeFZVVkRhRTFSVWpKNGRsbHRSbk5WTW14dVltbENkV1JwTVhwWlZFVlJUVUUwUjBFeFZVVkRlRTFJVlcwNWRtUkRRa1JSVkVWaVRVSnJSMEV4VlVWQmVFMVRVako0ZGxsdFJuTlZNbXh1WW1sQ1UySXlPVEJKUlU1Q1RVSTBXRVJVU1hkTlJGbDRUMVJCZDAxRVFUQk5iRzlZUkZSSk5FMUVSWGxQUkVGM1RVUkJNRTFzYjNkU2VrVk1UVUZyUjBFeFZVVkNhRTFEVmxaTmVFbHFRV2RDWjA1V1FrRnZWRWRWWkhaaU1tUnpXbE5DVldOdVZucGtRMEpVV2xoS01tRlhUbXhqZVVKTlZFVk5lRVpFUVZOQ1owNVdRa0ZOVkVNd1pGVlZlVUpUWWpJNU1FbEdTWGhOU1VsRFNXcEJUa0puYTNGb2EybEhPWGN3UWtGUlJVWkJRVTlEUVdjNFFVMUpTVU5EWjB0RFFXZEZRWFJvUlVOcGVEZHFiMWhsWWs4NWVTOXNSRFl6YkdGa1FWQkxTRGxuZG13NVRXZGhRMk5tWWpKcVNDODNOazUxT0dGcE5saHNOazlOVXk5cmNqbHlTRFY2YjFGa2MyWnVSbXc1TjNaMVprdHFObUozVTJsV05tNXhiRXR5SzBOTmJuazJVM2h1UjFCaU1UVnNLemhCY0dVMk1tbHRPVTFhWVZKM01VNUZSRkJxVkhKRlZHODRaMWxpUlhaekwwRnRVVE0xTVd0TFUxVnFRalpITURCcU1IVlpUMFJRTUdkdFNIVTRNVWs0UlRORGQyNXhTV2x5ZFRaNk1XdGFNWEVyVUhOQlpYZHVha2g0WjNOSVFUTjVObTFpVjNkYVJISllXV1pwV1dGU1VVMDVjMGh0YTJ4RGFYUkVNemh0TldGblNTOXdZbTlRUjJsVlZTczJSRTl2WjNKR1dsbEtjM1ZDTm1wRE5URXhjSHB5Y0RGYWEybzFXbEJoU3pRNWJEaExSV280UXpoUlRVRk1XRXd6TW1nM1RURmlTM2RaVlVnclJUUkZlazVyZEUxbk5sUlBPRlZ3YlhaTmNsVndjM2xWY1hSRmFqVmpkVWhMV2xCbWJXZG9RMDQyU2pORGFXOXFOazlIWVVzdlIxQTFRV1pzTkM5WWRHTmtMM0F5YUM5eWN6TTNSVTlsV2xaWWRFd3diVGM1V1VJd1pYTlhRM0oxVDBNM1dFWjRXWEJXY1RsUGN6WndSa3hMWTNkYWNFUkpiRlJwY25oYVZWUlJRWE0yY1hwcmJUQTJjRGs0WnpkQ1FXVXJaRVJ4Tm1SemJ6UTVPV2xaU0RaVVMxZ3ZNVmszUkhwcmRtZDBaR2w2YW10WVVHUnpSSFJSUTNZNVZYY3JkM0E1VlRkRVlrZExiMmRRWlUxaE0wMWtLM0IyWlhvM1Z6TTFSV2xGZFdFckszUm5lUzlDUW1wR1JrWjVNMnd6VjBad1R6bExWMmQ2TjNwd2JUZEJaVXRLZERoVU1URmtiR1ZEWm1WWWEydFZRVXRKUVdZMWNXOUpZbUZ3YzFwWGQzQmlhMDVHYUVoaGVESjRTVkJGUkdkbVp6RmhlbFpaT0RCYVkwWjFZM1JNTjFSc1RHNU5VUzh3YkZWVVltbFRkekZ1U0RZNVRVYzJlazh3WWpsbU5rSlJaR2RCYlVRd05ubExOVFp0UkdOWlFscFZRMEYzUlVGQllVOURRVlJuZDJkblJUQk5RVFJIUVRGVlpFUjNSVUl2ZDFGRlFYZEpRbWhxUVZCQ1owNVdTRkpOUWtGbU9FVkNWRUZFUVZGSUwwMUNNRWRCTVZWa1JHZFJWMEpDVkd0eWVYTnRZMUp2Y2xORFpVWk1NVXB0VEU4dmQybFNUbmhRYWtGbVFtZE9Wa2hUVFVWSFJFRlhaMEpTWjJVeVdXRlNVVEpZZVc5c1VVd3pNRVY2VkZOdkx5OTZPVk42UW1kQ1oyZHlRbWRGUmtKUlkwSkJVVkpWVFVaSmQwcFJXVWxMZDFsQ1FsRlZTRTFCUjBkSFYyZ3daRWhCTmt4NU9YWlpNMDUzVEc1Q2NtRlROVzVpTWpsdVRESmtlbU5xUlhkTFVWbEpTM2RaUWtKUlZVaE5RVXRIU0Zkb01HUklRVFpNZVRsM1lUSnJkVm95T1haYWVUbHVZek5KZUV3eVpIcGpha1YxV1ROS01FMUVTVWRCTVZWa1NIZFJjazFEYTNkS05rRnNiME5QUjBsWGFEQmtTRUUyVEhrNWFtTnRkM1ZqUjNSd1RHMWtkbUl5WTNaYU0wNTVUVk01Ym1NelNYaE1iVTU1WWtSQk4wSm5UbFpJVTBGRlRrUkJlVTFCWjBkQ2JXVkNSRUZGUTBGVVFVbENaMXB1WjFGM1FrRm5TWGRFVVZsTVMzZFpRa0pCU0ZkbFVVbEdRWGRKZDBSUldVeExkMWxDUWtGSVYyVlJTVVpCZDAxM1JGRlpTa3R2V2tsb2RtTk9RVkZGVEVKUlFVUm5aMFZDUVVSVGEwaHlSVzl2T1VNd1pHaGxiVTFZYjJnMlpFWlRVSE5xWW1SQ1drSnBUR2M1VGxJemREVlFLMVEwVm5obWNUZDJjV1pOTDJJMVFUTlNhVEZtZVVwdE9XSjJhR1JIWVVwUk0ySXlkRFo1VFVGWlRpOXZiRlZoZW5OaFRDdDVlVVZ1T1Zkd2NrdEJVMDl6YUVsQmNrRnZlVnBzSzNSS1lXOTRNVEU0Wm1WemMyMVliakZvU1ZaM05ERnZaVkZoTVhZeGRtYzBSblkzTkhwUWJEWXZRV2hUY25jNVZUVndRMXBGZERSWGFUUjNVM1I2Tm1SVVdpOURURUZPZURoTVdtZ3hTamRSU2xacU1tWm9UWFJtVkVweU9YYzBlak13V2pJd09XWlBWVEJwVDAxNUszRmtkVUp0Y0haMldYVlNOMmhhVERaRWRYQnplbVp1ZHpCVGEyWjBhSE14T0dSSE9WcExZalU1VldoMmJXRlRSMXBTVm1KT1VYQnpaek5DV214MmFXUXdiRWxMVHpKa01YaHZlbU5zVDNwbmFsaFFXVzkyU2twSmRXeDBlbXROZFRNMGNWRmlPVk42TDNscGJISmlRMmRxT0QwaVhYMC5leUp1YjI1alpTSTZJa041VlZwNWVXNVNZbFJOVlVRMVprNTJWbnByY3psSFVWcFlNV3RuTm1wd1FsbzBXV2d5SzB4amFUUTlJaXdpZEdsdFpYTjBZVzF3VFhNaU9qRTJORGsyT0RVeE1qTTNNREVzSW1Gd2ExQmhZMnRoWjJWT1lXMWxJam9pWTI5dExtZHZiMmRzWlM1aGJtUnliMmxrTG1kdGN5SXNJbUZ3YTBScFoyVnpkRk5vWVRJMU5pSTZJakZYYkVsQmJVWk1iVFptZWtsdVZreHNka3BLWm5OMmJURnpRWE5OWkRWS09GWlpVRnBwVWxsdFpFazlJaXdpWTNSelVISnZabWxzWlUxaGRHTm9JanAwY25WbExDSmhjR3REWlhKMGFXWnBZMkYwWlVScFoyVnpkRk5vWVRJMU5pSTZXeUk0VURGelZ6QkZVRXBqYzJ4M04xVjZVbk5wV0V3Mk5IY3JUelV3UldRclVrSkpRM1JoZVRGbk1qUk5QU0pkTENKaVlYTnBZMGx1ZEdWbmNtbDBlU0k2ZEhKMVpTd2laWFpoYkhWaGRHbHZibFI1Y0dVaU9pSkNRVk5KUXlKOS5LbUl2RVFGWkVRSTF1TUJhLXVLc3pFU2xFUTgtZ05ESTVjbkw1cWh3Z1Qyb25lRll5a3dJMWJWaVVtTkRvTWFiamhVRHRHUGNJS1lVMGxIODJ5Rm5rZ1Blb1FrSGo3ektjTEkxX1hOUzR4WlFLaUlLaFdYZG95QV82U3UwNE90azdmQUFrN2tENXotZC0xYmxRbXdBeFd5MHlzTXNqV21WSF9CX1BuSVIySmsybmMzU3V2bTVkYmQ5Zm55SnBiQnZkMWd3NHdudlJPVVVZQVVadGNBYUJGZV9BSzJlMFAxYm90S1dmM2hWTGhIWEhWVmhoNURaZjhvVjM4OW1jM0Naa2NQZkpCNHpjUmdtaXV2MDVDaTl4dy10RkZmQklaQWRTa3Q1WThPVmdnX3VUUWp3VkZDOFNNd1BaT0JxQ1dBeWpHdjVEaGw5WWNBd2dGTW1zbXJPOFFoYXV0aERhdGFYxcY-yg23lncBLbnB_IQLgUnhjmcR07HUho1A5EcRGCzCRQAAAAC5P9lh8uZGL7EiggAiR954AEEBKZUGAhkJ6H_lg4NUtXUwyLdisU96qpU3wU04F0tEquH2yiPJRgN-jczWEhsCwJz8vUTZSa-O_qXDamJOztlCRqUBAgMmIAEhWCBGyrjtFzSah8NZE7URWs04pem92YtMkLNWPnA6__PhBiJYIGsquFATfD_rgZhc8Ley5-XVExCV7XJknod49e_u8ECM'
+print(AttestationObject(websafe_decode(android_attestation_object)))
+android_att = Attestation.from_base64(android_attestation_object)
+print(android_att)
+android_verified = md.verify_attestation(attestation=android_att, client_data=websafe_decode(android_client_data))
+print(f'android: {android_verified}')
