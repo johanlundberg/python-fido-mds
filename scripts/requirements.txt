@@ -1,4 +1,4 @@
 pydantic
 cryptography
+jwcrypto
 pyOpenSSL
-fido2

@@ -17,7 +17,6 @@ ROOT_CERT = Path('./globalsign_root_r3.der')
 CN = 'mds.fidoalliance.org'
 
 
-
 def load_root_cert(path: Path) -> x509.Certificate:
     try:
         with open(path, 'rb') as f:

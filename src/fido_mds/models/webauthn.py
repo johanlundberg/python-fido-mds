@@ -23,7 +23,7 @@ class AttestationFormat(str, Enum):
     FIDO_U2F = 'fido-u2f'
     NONE = 'none'
     ANDROID_KEY = 'android-key'
-    ANDROID_SAFTYNET = 'android-safetynet'
+    ANDROID_SAFETYNET = 'android-safetynet'
     TPM = 'tpm'
     APPLE = 'apple'
 
@@ -127,7 +127,7 @@ class Attestation(AttestationConfig):
     auth_data: AuthenticatorData = Field(alias='authData')
     ep_att: Optional[bytes]
     large_blob_key: Optional[bytes]
-    attestation_obj_bytes: bytes
+    raw_attestation_obj: bytes
 
     @property
     def certificate_key_identifier(self) -> Optional[str]:
@@ -138,14 +138,17 @@ class Attestation(AttestationConfig):
 
     @property
     def attestation_obj(self) -> AttestationObject:
-        return AttestationObject(self.attestation_obj_bytes)
+        return AttestationObject(self.raw_attestation_obj)
 
     @classmethod
     def from_attestation_object(cls, data: AttestationObject) -> Attestation:
         d = dict((k.string_key, v) for k, v in data.data.items())
-        d['attestation_obj_bytes'] = bytes(data)
+        d['raw_attestation_obj'] = bytes(data)
         return cls.parse_obj(d)
 
     @classmethod
     def from_base64(cls, data: str) -> Attestation:
-        return cls.from_attestation_object(AttestationObject(websafe_decode(data)))
+        try:
+            return cls.from_attestation_object(AttestationObject(websafe_decode(data)))
+        except AttributeError as e:
+            raise AttributeError(f'Could not parse attestation: {e}')

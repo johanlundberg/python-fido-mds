@@ -22,6 +22,9 @@ iana_cose_algs.csv:
 cose_algs: iana_cose_algs.csv
 	$(PYTHON) -c "from csv import DictReader; print({item.get('Value'): item.get('Name') for item in DictReader(open('./iana_cose_algs.csv'))})"
 
+update_package_data: metadata.json apple_webauthn_root_ca.pem
+	cp metadata.json apple_webauthn_root_ca.pem ../src/fido_mds/data/
+
 clean:
 	rm metadata.json globalsign_root_r3.der fido_alliance_mds.jwt iana_cose_algs.csv
 
