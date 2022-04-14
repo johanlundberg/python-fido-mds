@@ -18,7 +18,6 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     classifiers=[
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
@@ -35,7 +34,7 @@ setuptools.setup(
     package_data={
         "fido_mds": ["data/metadata.json", "data/apple_webauthn_root_ca.pem"],
     },
-    python_requires=">=3.7, <4",
+    python_requires=">=3.8, <4",
     install_requires=[
         "fido2",
         "pydantic",
