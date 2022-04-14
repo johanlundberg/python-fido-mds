@@ -22,8 +22,6 @@ jobs:
       fail-fast: false
       matrix:
         language: ['python']
-    env:
-      PIP_INDEX_URL: https://pypi.sunet.se/simple/
 
     steps:
     - name: Checkout repository
