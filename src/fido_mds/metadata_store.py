@@ -2,28 +2,26 @@
 import logging
 from importlib import resources
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Type, TypeVar, Union
 from uuid import UUID
 
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.x509 import Certificate
-from fido2.attestation import (
-    AndroidSafetynetAttestation,
-    AppleAttestation,
-    FidoU2FAttestation,
-    PackedAttestation,
-    TpmAttestation,
-)
+from fido2.attestation import AndroidSafetynetAttestation, AppleAttestation
+from fido2.attestation import Attestation as Fido2Attestation
+from fido2.attestation import FidoU2FAttestation, PackedAttestation, TpmAttestation
 from fido2.attestation.base import InvalidAttestation
 from fido2.cose import CoseKey
 
 from fido_mds.exceptions import AttestationVerificationError, MetadataValidationError
 from fido_mds.helpers import cert_chain_verified, hash_with, load_raw_cert
 from fido_mds.models.fido_mds import Entry, FidoMD
+from fido_mds.models.webauthn import Attestation, AttestationFormat
 
 __author__ = 'lundberg'
 
-from fido_mds.models.webauthn import Attestation, AttestationFormat
+
+TFido2AttestationSubclass = TypeVar('TFido2AttestationSubclass', bound=Fido2Attestation)
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +39,32 @@ class FidoMetadataStore:
             with resources.open_text('fido_mds.data', 'metadata.json') as f:
                 self.metadata = FidoMD.parse_raw(f.read())
 
+        self._entry_cache: Dict[Union[str, UUID], Entry] = {}
         self.external_root_certs: Dict[str, List[Certificate]] = {}
+
         # load known external root certs
         with resources.open_binary('fido_mds.data', 'apple_webauthn_root_ca.pem') as arc:
             self.add_external_root_certs(name='apple', root_certs=[arc.read()])
-        self._entry_cache: Dict[Union[str, UUID], Entry] = {}
+
+    @staticmethod
+    def _verify_attestation_as_type(
+        attestation_type: Type[TFido2AttestationSubclass],
+        attestation: Attestation,
+        client_data_hash: bytes,
+        allow_rooted_device: bool = False,
+    ):
+        if attestation_type is AndroidSafetynetAttestation:
+            fido2_attestation = attestation_type(allow_rooted=allow_rooted_device)
+        else:
+            fido2_attestation = attestation_type()
+        try:
+            fido2_attestation.verify(
+                statement=attestation.attestation_obj.att_statement,
+                auth_data=attestation.attestation_obj.auth_data,
+                client_data_hash=client_data_hash,
+            )
+        except InvalidAttestation as e:
+            raise AttestationVerificationError(f'Invalid attestation: {e}')
 
     def add_external_root_certs(self, name: str, root_certs: List[Union[bytes, str]]) -> None:
         certs = []
@@ -114,16 +133,9 @@ class FidoMetadataStore:
     def verify_packed_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
         cose_key = CoseKey.for_alg(attestation.att_statement.alg)
         client_data_hash = hash_with(hash_alg=cose_key._HASH_ALG, data=client_data)
-        try:
-            PackedAttestation().verify(
-                statement=attestation.attestation_obj.att_statement,
-                auth_data=attestation.attestation_obj.auth_data,
-                client_data_hash=client_data_hash,
-            )
-        except InvalidAttestation as e:
-            raise AttestationVerificationError(f'Invalid attestation: {e}')
+        self._verify_attestation_as_type(PackedAttestation, attestation=attestation, client_data_hash=client_data_hash)
 
-        # validate leaf cert again root cert in metadata
+        # validate leaf cert against root cert in metadata
         root_certs = self.get_root_certs(aaguid=attestation.auth_data.credential_data.aaguid)
         if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=root_certs):
             return True
@@ -131,14 +143,7 @@ class FidoMetadataStore:
 
     def verify_apple_anonymous_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
         client_data_hash = hash_with(hash_alg=SHA256(), data=client_data)
-        try:
-            AppleAttestation().verify(
-                statement=attestation.attestation_obj.att_statement,
-                auth_data=attestation.attestation_obj.auth_data,
-                client_data_hash=client_data_hash,
-            )
-        except InvalidAttestation as e:
-            raise AttestationVerificationError(f'Invalid attestation: {e}')
+        self._verify_attestation_as_type(AppleAttestation, attestation=attestation, client_data_hash=client_data_hash)
 
         # validata leaf cert against Apple root cert
         if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=self.external_root_certs['apple']):
@@ -147,16 +152,9 @@ class FidoMetadataStore:
 
     def verify_tpm_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
         client_data_hash = hash_with(hash_alg=SHA256(), data=client_data)
-        try:
-            TpmAttestation().verify(
-                statement=attestation.attestation_obj.att_statement,
-                auth_data=attestation.attestation_obj.auth_data,
-                client_data_hash=client_data_hash,
-            )
-        except InvalidAttestation as e:
-            raise AttestationVerificationError(f'Invalid attestation: {e}')
+        self._verify_attestation_as_type(TpmAttestation, attestation=attestation, client_data_hash=client_data_hash)
 
-        # validata leaf cert again root cert in metadata
+        # validata leaf cert against root cert in metadata
         root_certs = self.get_root_certs(aaguid=attestation.auth_data.credential_data.aaguid)
         if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=root_certs):
             return True
@@ -166,20 +164,18 @@ class FidoMetadataStore:
         self, attestation: Attestation, client_data: bytes, allow_rooted_device: bool = False
     ) -> bool:
         client_data_hash = hash_with(hash_alg=SHA256(), data=client_data)
-        try:
-            AndroidSafetynetAttestation(allow_rooted=allow_rooted_device).verify(
-                statement=attestation.attestation_obj.att_statement,
-                auth_data=attestation.attestation_obj.auth_data,
-                client_data_hash=client_data_hash,
-            )
-        except InvalidAttestation as e:
-            raise AttestationVerificationError(f'Invalid attestation: {e}')
+        self._verify_attestation_as_type(
+            AndroidSafetynetAttestation,
+            attestation=attestation,
+            client_data_hash=client_data_hash,
+            allow_rooted_device=allow_rooted_device,
+        )
 
         # TODO: jwt header alg should correspond to a authentication alg in metadata, but how?
         #   ex. header alg RS256 is not in metadata algs ['secp256r1_ecdsa_sha256_raw']
         # authn_algs = self.get_authentication_algs(aaguid=attestation.auth_data.credential_data.aaguid)
         # alg = attestation.att_statement.response.header.alg
-        # validata leaf cert again root cert in metadata
+        # validata leaf cert against root cert in metadata
         if not attestation.att_statement.response:
             raise AttestationVerificationError('attestation is missing response jwt')
         root_certs = self.get_root_certs(aaguid=attestation.auth_data.credential_data.aaguid)
@@ -189,14 +185,7 @@ class FidoMetadataStore:
 
     def verify_fido_u2f_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
         client_data_hash = hash_with(hash_alg=SHA256(), data=client_data)
-        try:
-            FidoU2FAttestation().verify(
-                statement=attestation.attestation_obj.att_statement,
-                auth_data=attestation.attestation_obj.auth_data,
-                client_data_hash=client_data_hash,
-            )
-        except InvalidAttestation as e:
-            raise AttestationVerificationError(f'Invalid attestation: {e}')
+        self._verify_attestation_as_type(FidoU2FAttestation, attestation=attestation, client_data_hash=client_data_hash)
 
         root_certs = self.get_root_certs(cki=attestation.certificate_key_identifier)
         if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=root_certs):

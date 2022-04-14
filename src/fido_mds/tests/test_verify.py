@@ -6,7 +6,7 @@ from fido2.utils import websafe_decode
 from fido_mds.exceptions import MetadataValidationError
 from fido_mds.metadata_store import FidoMetadataStore
 from fido_mds.models.webauthn import Attestation
-from fido_mds.tests.data import YUBIKEY_4, YUBIKEY_5_NFC, IPHONE_12, MICROSOFT_SURFACE_1796, NEXUS_5
+from fido_mds.tests.data import IPHONE_12, MICROSOFT_SURFACE_1796, NEXUS_5, YUBIKEY_4, YUBIKEY_5_NFC
 
 __author__ = 'lundberg'
 

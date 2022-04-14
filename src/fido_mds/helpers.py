@@ -11,7 +11,6 @@ from cryptography.x509 import Certificate
 
 __author__ = 'lundberg'
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -46,8 +45,8 @@ def cert_chain_verified(cert_chain: List[Certificate], root_certs: List[Certific
         ctx = crypto.X509StoreContext(store, crypto.X509.from_cryptography(cert_to_check))
         try:
             ctx.verify_certificate()
-            cert_verified = True
             logger.debug(f'Root cert with SHA256 fingerprint {repr(root_cert.fingerprint(SHA256()))} matched')
+            return True
         except crypto.X509StoreContextError:
             logger.debug(f'Root cert with SHA256 fingerprint {repr(root_cert.fingerprint(SHA256()))} did NOT match')
             continue
