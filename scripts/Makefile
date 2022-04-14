@@ -14,7 +14,7 @@ metadata.json: globalsign_root_r3.der fido_alliance_mds.jwt
 	$(PYTHON) update_metadata.py > metadata.json
 
 apple_webauthn_root_ca.pem:
-	$(CURl) -o apple_webauthn_root_ca.pem https://www.apple.com/certificateauthority/Apple_WebAuthn_Root_CA.pem
+	$(CURL) -o apple_webauthn_root_ca.pem https://www.apple.com/certificateauthority/Apple_WebAuthn_Root_CA.pem
 
 iana_cose_algs.csv:
 	$(CURL) -o iana_cose_algs.csv https://www.iana.org/assignments/cose/algorithms.csv
