@@ -27,6 +27,9 @@ jobs:
           python -m pip install --upgrade pip virtualenv
           pip install -r test_requirements.txt
 
+      - name: Update package data
+        run: make update_package_data
+
       - name: Test with pytest
         run: |
           make test
