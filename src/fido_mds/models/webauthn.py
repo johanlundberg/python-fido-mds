@@ -130,6 +130,12 @@ class Attestation(AttestationConfig):
     raw_attestation_obj: bytes
 
     @property
+    def aaguid(self) -> Optional[UUID]:
+        if self.fmt is not AttestationFormat.FIDO_U2F:
+            return self.auth_data.credential_data.aaguid
+        return None
+
+    @property
     def certificate_key_identifier(self) -> Optional[str]:
         if self.fmt is AttestationFormat.FIDO_U2F and self.att_statement.x5c:
             cki = x509.SubjectKeyIdentifier.from_public_key(self.att_statement.x5c[0].public_key())

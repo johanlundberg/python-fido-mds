@@ -11,11 +11,8 @@ from fido_mds.tests.data import IPHONE_12, MICROSOFT_SURFACE_1796, NEXUS_5, YUBI
 __author__ = 'lundberg'
 
 
-mds = FidoMetadataStore()
-
-
 @pytest.mark.parametrize('attestation_obj,client_data', [YUBIKEY_4, YUBIKEY_5_NFC, MICROSOFT_SURFACE_1796, NEXUS_5])
-def test_verify(attestation_obj, client_data):
+def test_verify(mds: FidoMetadataStore, attestation_obj: str, client_data: str):
     att = Attestation.from_base64(attestation_obj)
     cd = websafe_decode(client_data)
     assert mds.verify_attestation(attestation=att, client_data=cd) is True
@@ -23,7 +20,7 @@ def test_verify(attestation_obj, client_data):
 
 # test attestations with short-lived certs so metadata can't be validated
 @pytest.mark.parametrize('attestation_obj,client_data', [IPHONE_12])
-def test_verify_no_validate(attestation_obj, client_data):
+def test_verify_no_validate(mds: FidoMetadataStore, attestation_obj: str, client_data: str):
     att = Attestation.from_base64(attestation_obj)
     cd = websafe_decode(client_data)
     with pytest.raises(MetadataValidationError):

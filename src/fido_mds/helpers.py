@@ -3,11 +3,11 @@
 import logging
 from typing import List, Union
 
-from OpenSSL import crypto
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.hashes import SHA256, HashAlgorithm
 from cryptography.x509 import Certificate
+from OpenSSL import crypto
 
 __author__ = 'lundberg'
 

@@ -40,6 +40,7 @@ class FidoMetadataStore:
                 self.metadata = FidoMD.parse_raw(f.read())
 
         self._entry_cache: Dict[Union[str, UUID], Entry] = {}
+        self._other_cache: Dict[str, List[Union[str, int]]] = {}
         self.external_root_certs: Dict[str, List[Certificate]] = {}
 
         # load known external root certs
@@ -95,15 +96,14 @@ class FidoMetadataStore:
                 return entry
         return None
 
-    def get_entry(self, aaguid: Optional[UUID] = None, cki: Optional[str] = None) -> Optional[Entry]:
-        if aaguid:
-            return self.get_entry_for_aaguid(aaguid=aaguid)
-        elif cki:
-            return self.get_entry_for_certificate_key_identifier(cki=cki)
-        return None
+    def get_entry(self, authenticator_id: Union[UUID, str]) -> Optional[Entry]:
+        if isinstance(authenticator_id, UUID):
+            return self.get_entry_for_aaguid(aaguid=authenticator_id)
+        else:
+            return self.get_entry_for_certificate_key_identifier(cki=authenticator_id)
 
-    def get_root_certs(self, aaguid: Optional[UUID] = None, cki: Optional[str] = None) -> List[Certificate]:
-        metadata_entry = self.get_entry(aaguid=aaguid, cki=cki)
+    def get_root_certs(self, authenticator_id: Union[UUID, str]) -> List[Certificate]:
+        metadata_entry = self.get_entry(authenticator_id=authenticator_id)
         if metadata_entry:
             return [
                 load_raw_cert(cert=root_cert)
@@ -111,11 +111,44 @@ class FidoMetadataStore:
             ]
         return list()
 
-    def get_authentication_algs(self, aaguid: Optional[UUID] = None, cki: Optional[str] = None) -> List[str]:
-        metadata_entry = self.get_entry(aaguid=aaguid, cki=cki)
+    def get_authentication_algs(self, authenticator_id: Union[UUID, str]) -> List[str]:
+        metadata_entry = self.get_entry(authenticator_id=authenticator_id)
         if metadata_entry:
             return metadata_entry.metadata_statement.authentication_algorithms
         return list()
+
+    def get_user_verification_methods(self) -> List[Union[str, int]]:
+        key = 'user_verification_methods'
+        if key in self._other_cache:
+            return self._other_cache[key]
+        res = set()
+        for entry in self.metadata.entries:
+            for uvd in entry.metadata_statement.get_user_verification_details():
+                res.add(uvd.user_verification_method)
+        self._other_cache[key] = list(res)
+        return list(res)
+
+    def get_key_protections(self) -> List[Union[str, int]]:
+        key = 'key_protections'
+        if key in self._other_cache:
+            return self._other_cache[key]
+        res = set()
+        for entry in self.metadata.entries:
+            for item in entry.metadata_statement.key_protection:
+                res.add(item)
+        self._other_cache[key] = list(res)
+        return list(res)
+
+    def get_crypto_strengths(self) -> List[Union[str, int]]:
+        key = 'crypto_strengths'
+        if key in self._other_cache:
+            return self._other_cache[key]
+        res = set()
+        for entry in self.metadata.entries:
+            if entry.metadata_statement.crypto_strength is not None:
+                res.add(entry.metadata_statement.crypto_strength)
+        self._other_cache[key] = list(res)
+        return list(res)
 
     def verify_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
         if attestation.fmt is AttestationFormat.PACKED:
@@ -136,7 +169,7 @@ class FidoMetadataStore:
         self._verify_attestation_as_type(PackedAttestation, attestation=attestation, client_data_hash=client_data_hash)
 
         # validate leaf cert against root cert in metadata
-        root_certs = self.get_root_certs(aaguid=attestation.auth_data.credential_data.aaguid)
+        root_certs = self.get_root_certs(authenticator_id=attestation.auth_data.credential_data.aaguid)
         if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=root_certs):
             return True
         raise MetadataValidationError('metadata root cert does not match attestation cert')
@@ -155,7 +188,7 @@ class FidoMetadataStore:
         self._verify_attestation_as_type(TpmAttestation, attestation=attestation, client_data_hash=client_data_hash)
 
         # validata leaf cert against root cert in metadata
-        root_certs = self.get_root_certs(aaguid=attestation.auth_data.credential_data.aaguid)
+        root_certs = self.get_root_certs(authenticator_id=attestation.auth_data.credential_data.aaguid)
         if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=root_certs):
             return True
         raise MetadataValidationError('metadata root cert does not match attestation cert')
@@ -178,7 +211,7 @@ class FidoMetadataStore:
         # validata leaf cert against root cert in metadata
         if not attestation.att_statement.response:
             raise AttestationVerificationError('attestation is missing response jwt')
-        root_certs = self.get_root_certs(aaguid=attestation.auth_data.credential_data.aaguid)
+        root_certs = self.get_root_certs(authenticator_id=attestation.auth_data.credential_data.aaguid)
         if cert_chain_verified(cert_chain=attestation.att_statement.response.header.x5c, root_certs=root_certs):
             return True
         raise MetadataValidationError('metadata root cert does not match attestation cert')
@@ -187,7 +220,8 @@ class FidoMetadataStore:
         client_data_hash = hash_with(hash_alg=SHA256(), data=client_data)
         self._verify_attestation_as_type(FidoU2FAttestation, attestation=attestation, client_data_hash=client_data_hash)
 
-        root_certs = self.get_root_certs(cki=attestation.certificate_key_identifier)
+        assert attestation.certificate_key_identifier is not None  # please mypy
+        root_certs = self.get_root_certs(authenticator_id=attestation.certificate_key_identifier)
         if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=root_certs):
             return True
         raise MetadataValidationError('metadata root cert does not match attestation cert')
