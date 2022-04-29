@@ -1,0 +1,14 @@
+triggers:
+  cron: "@monthly"
+script:
+  - virtualenv venv
+  - . venv/bin/activate
+  - pip install -r test_requirements.txt
+  - pip install -r scripts/requirements.txt
+  - make update_package_data
+  - make typecheck
+  - make test
+  - make build
+publish_over_ssh:
+  - pypi.sunet.se
+clean_workspace: true

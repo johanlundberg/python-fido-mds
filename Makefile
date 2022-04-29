@@ -1,7 +1,7 @@
 TOPDIR:=        $(abspath .)
 SOURCE=         $(TOPDIR)/src
-PYTHON=$(shell which python)
-PIP=$(shell which pip)
+PYTHON=         $(shell which python)
+PIP=            $(shell which pip)
 
 reformat:
 	isort --line-width 120 --atomic $(SOURCE)
