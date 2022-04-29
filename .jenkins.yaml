@@ -3,7 +3,7 @@ triggers:
 pre_build_script:
   - apt-get -y install curl
 script:
-  - python3 -m venv venv
+  - python3.8 -m venv venv
   - . venv/bin/activate
   - pip install --upgrade pip virtualenv
   - pip install -r test_requirements.txt
