@@ -31,7 +31,12 @@ def load_raw_cert(cert: Union[bytes, str]) -> x509.Certificate:
 
 def cert_chain_verified(cert_chain: List[Certificate], root_certs: List[Certificate]) -> bool:
     cert_verified = False
-    cert_to_check = cert_chain[0]  # first cert in chain is the one we want to verify
+    try:
+        cert_to_check = cert_chain[0]  # first cert in chain is the one we want to verify
+    except IndexError:
+        logger.error('no certificate to validate in certificate chain')
+        return cert_verified
+
     # create store and add root cert
     for root_cert in root_certs:
         store = crypto.X509Store()
