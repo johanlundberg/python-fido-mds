@@ -60,7 +60,7 @@ class FidoMetadataStore:
             fido2_attestation = attestation_type()
         try:
             fido2_attestation.verify(
-                statement=attestation.attestation_obj.att_statement,
+                statement=attestation.attestation_obj.att_stmt,
                 auth_data=attestation.attestation_obj.auth_data,
                 client_data_hash=client_data_hash,
             )

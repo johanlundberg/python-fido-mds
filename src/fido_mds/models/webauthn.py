@@ -3,14 +3,14 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Mapping, Any
 from uuid import UUID
 
 from cryptography import x509
 from cryptography.x509 import Certificate
 from fido2.cose import ES256, PS256, RS1, RS256, CoseKey, EdDSA
-from fido2.ctap2 import AttestationObject
 from fido2.utils import websafe_decode
+from fido2.webauthn import AttestationObject
 from pydantic import BaseModel, Field, validator
 
 __author__ = 'lundberg'
@@ -99,7 +99,7 @@ class CredentialData(AttestationConfig):
         return UUID(bytes=v)
 
     @validator('public_key', pre=True)
-    def validate_public_key(cls, v: bytes) -> UUID:
+    def validate_public_key(cls, v: Mapping[int, Any]) -> CoseKey:
         return CoseKey.parse(v)
 
 
@@ -123,10 +123,8 @@ class AuthenticatorData(AttestationConfig):
 
 class Attestation(AttestationConfig):
     fmt: AttestationFormat
-    att_statement: AttestationStatement = Field(alias='attStmt')
-    auth_data: AuthenticatorData = Field(alias='authData')
-    ep_att: Optional[bytes]
-    large_blob_key: Optional[bytes]
+    att_statement: AttestationStatement
+    auth_data: AuthenticatorData
     raw_attestation_obj: bytes
 
     @property
@@ -148,8 +146,12 @@ class Attestation(AttestationConfig):
 
     @classmethod
     def from_attestation_object(cls, data: AttestationObject) -> Attestation:
-        d = dict((k.string_key, v) for k, v in data.data.items())
-        d['raw_attestation_obj'] = bytes(data)
+        d = {
+            'fmt': data.fmt,
+            'att_statement': data.att_stmt,
+            'auth_data': data.auth_data,
+            'raw_attestation_obj': bytes(data),
+        }
         return cls.parse_obj(d)
 
     @classmethod
