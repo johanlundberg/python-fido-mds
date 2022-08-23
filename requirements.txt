@@ -1,4 +1,4 @@
 pydantic
 cryptography
 pyOpenSSL
-fido2
+fido2>=1.0.0
