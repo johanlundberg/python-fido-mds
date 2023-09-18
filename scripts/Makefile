@@ -26,7 +26,7 @@ update_package_data: metadata.json apple_webauthn_root_ca.pem
 	cp metadata.json apple_webauthn_root_ca.pem ../src/fido_mds/data/
 
 clean:
-	rm metadata.json globalsign_root_r3.der fido_alliance_mds.jwt iana_cose_algs.csv
+	rm -f metadata.json globalsign_root_r3.der fido_alliance_mds.jwt iana_cose_algs.csv
 
 all: metadata.json apple_webauthn_root_ca.pem
 
