@@ -55,7 +55,8 @@ class FidoMetadataStore:
         allow_rooted_device: bool = False,
     ):
         if attestation_type is AndroidSafetynetAttestation:
-            fido2_attestation = attestation_type(allow_rooted=allow_rooted_device)
+            # AndroidSafetynetAttestation do expect argument allow_rooted
+            fido2_attestation = attestation_type(allow_rooted=allow_rooted_device)  # type: ignore[call-arg]
         else:
             fido2_attestation = attestation_type()
         try:
@@ -164,8 +165,11 @@ class FidoMetadataStore:
         raise NotImplementedError(f'verification of {attestation.fmt.value} not implemented')
 
     def verify_packed_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
+        if attestation.att_statement.alg is None:
+            raise AttestationVerificationError("Algorithm missing in attestation statement for packed attestation")
         cose_key = CoseKey.for_alg(attestation.att_statement.alg)
-        client_data_hash = hash_with(hash_alg=cose_key._HASH_ALG, data=client_data)
+        # type ignore as subclasses do have _HASH_ALG implemented
+        client_data_hash = hash_with(hash_alg=cose_key._HASH_ALG, data=client_data)  # type: ignore[attr-defined]
         self._verify_attestation_as_type(PackedAttestation, attestation=attestation, client_data_hash=client_data_hash)
 
         # validate leaf cert against root cert in metadata
