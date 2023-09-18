@@ -18,12 +18,14 @@ from fido_mds.helpers import cert_chain_verified, hash_with, load_raw_cert
 from fido_mds.models.fido_mds import Entry, FidoMD
 from fido_mds.models.webauthn import Attestation, AttestationFormat
 
-__author__ = 'lundberg'
+__author__ = "lundberg"
 
 
-TFido2AttestationSubclass = TypeVar('TFido2AttestationSubclass', bound=Fido2Attestation)
+TFido2AttestationSubclass = TypeVar("TFido2AttestationSubclass", bound=Fido2Attestation)
 
 logger = logging.getLogger(__name__)
+
+ERROR_MSG_CERT_DOES_NOT_MATCH = "metadata root cert does not match attestation cert"
 
 
 class FidoMetadataStore:
@@ -31,12 +33,12 @@ class FidoMetadataStore:
         # default to bundled metadata
         if metadata_path is not None:
             try:
-                with open(metadata_path, 'r') as mdf:
+                with open(metadata_path, "r") as mdf:
                     self.metadata = FidoMD.parse_raw(mdf.read())
             except IOError as e:
-                logger.error(f'Could not open file {mdf}: {e}')
+                logger.error(f"Could not open file {mdf}: {e}")
         else:
-            with resources.open_text('fido_mds.data', 'metadata.json') as f:
+            with resources.open_text("fido_mds.data", "metadata.json") as f:
                 self.metadata = FidoMD.parse_raw(f.read())
 
         self._entry_cache: Dict[Union[str, UUID], Entry] = {}
@@ -44,8 +46,8 @@ class FidoMetadataStore:
         self.external_root_certs: Dict[str, List[Certificate]] = {}
 
         # load known external root certs
-        with resources.open_binary('fido_mds.data', 'apple_webauthn_root_ca.pem') as arc:
-            self.add_external_root_certs(name='apple', root_certs=[arc.read()])
+        with resources.open_binary("fido_mds.data", "apple_webauthn_root_ca.pem") as arc:
+            self.add_external_root_certs(name="apple", root_certs=[arc.read()])
 
     @staticmethod
     def _verify_attestation_as_type(
@@ -66,7 +68,7 @@ class FidoMetadataStore:
                 client_data_hash=client_data_hash,
             )
         except InvalidAttestation as e:
-            raise AttestationVerificationError(f'Invalid attestation: {e}')
+            raise AttestationVerificationError(f"Invalid attestation: {e}")
 
     def add_external_root_certs(self, name: str, root_certs: List[Union[bytes, str]]) -> None:
         certs = []
@@ -119,7 +121,7 @@ class FidoMetadataStore:
         return list()
 
     def get_user_verification_methods(self) -> List[Union[str, int]]:
-        key = 'user_verification_methods'
+        key = "user_verification_methods"
         if key in self._other_cache:
             return self._other_cache[key]
         res = set()
@@ -130,7 +132,7 @@ class FidoMetadataStore:
         return list(res)
 
     def get_key_protections(self) -> List[Union[str, int]]:
-        key = 'key_protections'
+        key = "key_protections"
         if key in self._other_cache:
             return self._other_cache[key]
         res = set()
@@ -141,7 +143,7 @@ class FidoMetadataStore:
         return list(res)
 
     def get_crypto_strengths(self) -> List[Union[str, int]]:
-        key = 'crypto_strengths'
+        key = "crypto_strengths"
         if key in self._other_cache:
             return self._other_cache[key]
         res = set()
@@ -162,7 +164,7 @@ class FidoMetadataStore:
             return self.verify_android_safetynet_attestation(attestation=attestation, client_data=client_data)
         if attestation.fmt is AttestationFormat.FIDO_U2F:
             return self.verify_fido_u2f_attestation(attestation=attestation, client_data=client_data)
-        raise NotImplementedError(f'verification of {attestation.fmt.value} not implemented')
+        raise NotImplementedError(f"verification of {attestation.fmt.value} not implemented")
 
     def verify_packed_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
         if attestation.att_statement.alg is None:
@@ -176,16 +178,16 @@ class FidoMetadataStore:
         root_certs = self.get_root_certs(authenticator_id=attestation.auth_data.credential_data.aaguid)
         if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=root_certs):
             return True
-        raise MetadataValidationError('metadata root cert does not match attestation cert')
+        raise MetadataValidationError(ERROR_MSG_CERT_DOES_NOT_MATCH)
 
     def verify_apple_anonymous_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
         client_data_hash = hash_with(hash_alg=SHA256(), data=client_data)
         self._verify_attestation_as_type(AppleAttestation, attestation=attestation, client_data_hash=client_data_hash)
 
         # validata leaf cert against Apple root cert
-        if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=self.external_root_certs['apple']):
+        if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=self.external_root_certs["apple"]):
             return True
-        raise MetadataValidationError('metadata root cert does not match attestation cert')
+        raise MetadataValidationError(ERROR_MSG_CERT_DOES_NOT_MATCH)
 
     def verify_tpm_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
         client_data_hash = hash_with(hash_alg=SHA256(), data=client_data)
@@ -195,7 +197,7 @@ class FidoMetadataStore:
         root_certs = self.get_root_certs(authenticator_id=attestation.auth_data.credential_data.aaguid)
         if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=root_certs):
             return True
-        raise MetadataValidationError('metadata root cert does not match attestation cert')
+        raise MetadataValidationError(ERROR_MSG_CERT_DOES_NOT_MATCH)
 
     def verify_android_safetynet_attestation(
         self, attestation: Attestation, client_data: bytes, allow_rooted_device: bool = False
@@ -214,11 +216,11 @@ class FidoMetadataStore:
         # alg = attestation.att_statement.response.header.alg
         # validata leaf cert against root cert in metadata
         if not attestation.att_statement.response:
-            raise AttestationVerificationError('attestation is missing response jwt')
+            raise AttestationVerificationError("attestation is missing response jwt")
         root_certs = self.get_root_certs(authenticator_id=attestation.auth_data.credential_data.aaguid)
         if cert_chain_verified(cert_chain=attestation.att_statement.response.header.x5c, root_certs=root_certs):
             return True
-        raise MetadataValidationError('metadata root cert does not match attestation cert')
+        raise MetadataValidationError(ERROR_MSG_CERT_DOES_NOT_MATCH)
 
     def verify_fido_u2f_attestation(self, attestation: Attestation, client_data: bytes) -> bool:
         client_data_hash = hash_with(hash_alg=SHA256(), data=client_data)
@@ -228,4 +230,4 @@ class FidoMetadataStore:
         root_certs = self.get_root_certs(authenticator_id=attestation.certificate_key_identifier)
         if cert_chain_verified(cert_chain=attestation.att_statement.x5c, root_certs=root_certs):
             return True
-        raise MetadataValidationError('metadata root cert does not match attestation cert')
+        raise MetadataValidationError(ERROR_MSG_CERT_DOES_NOT_MATCH)

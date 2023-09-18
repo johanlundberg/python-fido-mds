@@ -226,6 +226,13 @@ eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiOS1Uak5pOGotcF9IUWtsaFZLbzlJ
 biI6Imh0dHBzOlwvXC9kYXNoYm9hcmQuZGV2LmVkdWlkLnNlIiwiYW5kcm9pZFBhY2thZ2VOYW1lIjoiY29tLmFuZHJvaWQuY2hyb21lIn0
 """
 
+none_attestation_object = """o2NmbXRkbm9uZWdhdHRTdG10oGhhdXRoRGF0YViYxj7KDbeWdwEtucH8hAuBSeGOZxHTsdSGjUDkRxEYLMJdAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAFCRvlr2y1QgLxAbJYI1H-HBYDyMcpQECAyYgASFYIGjY1rmhCeHsVeb2o2sNKcJp67MJG785al2g1uAMIVwJIlggsQ4QvdBJpB7
+21HU4hbYknS-JhNtE0kM01_c2FKHm7Lc"""
+none_client_data = """eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiMFlJdWs0S0s2YjhCaU1yOFh6dUFFM2c2Z1dZOWEyd1RkWl
+puamhjQXNJTSIsIm9yaWdpbiI6Imh0dHBzOi8vZGFzaGJvYXJkLmRldi5lZHVpZC5zZSJ9"""
+
+
 YUBIKEY_4 = (yubikey_4_attestation_obj, yubikey_4_client_data)
 YUBIKEY_5_NFC = (yubikey_5_nfc_attestation_obj, yubikey_5_nfc_client_data)
 IPHONE_12 = (iphone_12_attestation_object, iphone_12_client_data_json)
@@ -234,3 +241,4 @@ MICROSOFT_SURFACE_1796 = (
     microsoft_surface_1796_client_data,
 )
 NEXUS_5 = (nexus_5_attestation_object, nexus_5_client_data)
+NONE_ATTESTATION = (none_attestation_object, none_client_data)  # ex. passkey
