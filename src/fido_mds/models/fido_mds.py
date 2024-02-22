@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional, Union
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 
 def date2datetime(value: str) -> datetime:
@@ -209,7 +209,7 @@ class StatusReport(BaseModel):
     url: Optional[str] = None
 
     # validators
-    _effective_date_to_datetime = validator("effective_date", pre=True, allow_reuse=True)(date2datetime)
+    _effective_date_to_datetime = field_validator("effective_date", mode="before")(date2datetime)
 
 
 class Entry(BaseModel):
@@ -223,7 +223,7 @@ class Entry(BaseModel):
     aaid: Optional[str] = None
 
     # validators
-    _time_of_last_status_change_to_datetime = validator("time_of_last_status_change", pre=True, allow_reuse=True)(
+    _time_of_last_status_change_to_datetime = field_validator("time_of_last_status_change", mode="before")(
         date2datetime
     )
 
@@ -235,4 +235,4 @@ class FidoMD(BaseModel):
     entries: List["Entry"]
 
     # validators
-    _next_update_to_datetime = validator("next_update", pre=True, allow_reuse=True)(date2datetime)
+    _next_update_to_datetime = field_validator("next_update", mode="before")(date2datetime)

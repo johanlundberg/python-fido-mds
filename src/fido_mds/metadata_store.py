@@ -34,12 +34,12 @@ class FidoMetadataStore:
         if metadata_path is not None:
             try:
                 with open(metadata_path, "r") as mdf:
-                    self.metadata = FidoMD.parse_raw(mdf.read())
+                    self.metadata = FidoMD.model_validate_json(mdf.read())
             except IOError as e:
                 logger.error(f"Could not open file {mdf}: {e}")
         else:
             with resources.open_text("fido_mds.data", "metadata.json") as f:
-                self.metadata = FidoMD.parse_raw(f.read())
+                self.metadata = FidoMD.model_validate_json(f.read())
 
         self._entry_cache: Dict[Union[str, UUID], Entry] = {}
         self._other_cache: Dict[str, List[Union[str, int]]] = {}
