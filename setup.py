@@ -1,7 +1,8 @@
 import setuptools
 from datetime import datetime
 
-current_version = datetime.utcnow().strftime("%Y.%m")
+# Fixed version will help for reproducible builds
+current_version = "2023.3"
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
