@@ -227,6 +227,9 @@ class Entry(BaseModel):
         date2datetime
     )
 
+    def get_latest_status_report(self) -> "StatusReport":
+        return max(self.status_reports, key=lambda sr: sr.effective_date)
+
 
 class FidoMD(BaseModel):
     legal_header: str = Field(..., alias="legalHeader")
