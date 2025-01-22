@@ -115,7 +115,10 @@ class AuthenticatorData(AttestationConfig):
         attested = bool(v & 0x40)
         extension_data = bool(v & 0x80)
         return AuthenticatorFlags(
-            attested=attested, user_present=user_present, user_verified=user_verified, extension_data=extension_data
+            attested=attested,
+            user_present=user_present,
+            user_verified=user_verified,
+            extension_data=extension_data,
         )
 
 

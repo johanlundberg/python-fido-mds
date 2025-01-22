@@ -7,7 +7,10 @@ from fido_mds.tests.data import MICROSOFT_SURFACE_1796, NEXUS_5, YUBIKEY_4, YUBI
 __author__ = "lundberg"
 
 
-@pytest.mark.parametrize("attestation_obj,client_data", [YUBIKEY_4, YUBIKEY_5_NFC, MICROSOFT_SURFACE_1796, NEXUS_5])
+@pytest.mark.parametrize(
+    "attestation_obj,client_data",
+    [YUBIKEY_4, YUBIKEY_5_NFC, MICROSOFT_SURFACE_1796, NEXUS_5],
+)
 def test_get_metadata_entry(mds: FidoMetadataStore, attestation_obj: str, client_data: str):
     att = Attestation.from_base64(attestation_obj)
     authenticator_id = att.aaguid or att.certificate_key_identifier
@@ -23,6 +26,17 @@ def test_get_metadata_entry(mds: FidoMetadataStore, attestation_obj: str, client
         assert (
             att.certificate_key_identifier in metadata_entry.metadata_statement.attestation_certificate_key_identifiers
         )
+
+
+def test_get_latest_report(mds: FidoMetadataStore):
+    for entry in mds.metadata.entries:
+        if len(entry.status_reports) > 1:
+            latest_report = entry.get_latest_status_report()
+            assert latest_report is not None
+            later_reports = [
+                report for report in entry.status_reports if report.effective_date > latest_report.effective_date
+            ]
+            assert len(later_reports) == 0
 
 
 def test_get_user_verification_methods(mds: FidoMetadataStore):
